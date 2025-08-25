@@ -1,0 +1,8 @@
+[package]
+name = "faer-amg"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+faer = { path = "../faer-rs/faer", version = "0.22"}
+faer-traits = { path = "../faer-rs/faer-traits", version = "0.22" }
