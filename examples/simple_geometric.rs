@@ -8,16 +8,18 @@ use faer::{
         conjugate_gradient::{
             conjugate_gradient, conjugate_gradient_scratch, CgError, CgInfo, CgParams,
         },
-        LinOp, Precond,
+        BiPrecond, LinOp, Precond,
     },
     prelude::{Reborrow, ReborrowMut},
     sparse::{SparseRowMat, Triplet},
     Col, MatMut, MatRef, Par,
 };
-use faer_amg::preconditioners::{multigrid::MultiGrid, smoothers::new_jacobi};
+use faer_amg::preconditioners::{
+    multigrid::MultiGrid,
+    smoothers::{new_jacobi, CholeskySolve},
+};
 
 /* TODO:
-* - Solve coarsest exactly
 * - Refinement study for pcg and stationary
 * - Full description of what this example does
 * - Use analytic solution for error computation
@@ -152,7 +154,14 @@ fn main() {
         let r = Arc::new(make_restriction(n_dofs));
         let p = Arc::new(make_interpolation(n_dofs));
         let mat = Arc::new(make_finite_difference(n_elements));
-        let smoother = Arc::new(new_jacobi(&mat.as_ref().as_ref(), 0.66));
+        let smoother: Arc<dyn BiPrecond<f64> + Send>;
+
+        if level == 0 {
+            let cholesky = CholeskySolve::new(mat.rb());
+            smoother = Arc::new(cholesky);
+        } else {
+            smoother = Arc::new(new_jacobi(&mat.as_ref().as_ref(), 0.66));
+        }
 
         println!(
             "Adding level {}: coarse DOFs = {}, fine DOFs = {}",

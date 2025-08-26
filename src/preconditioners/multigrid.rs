@@ -71,8 +71,12 @@ impl<T: RealField> MultiGrid<T> {
         par: Par,
         stack: &mut MemStack,
     ) {
-        let mut work = Mat::zeros(v.nrows(), v.ncols());
         let smoother = &self.smoothers[level];
+        if level == self.operators.len() - 1 {
+            smoother.apply(v, f, par, stack);
+            return;
+        }
+        let mut work = Mat::zeros(v.nrows(), v.ncols());
         let op = &self.operators[level];
 
         smooth(v.rb_mut(), f, op.clone(), smoother.clone(), par, stack, 1);
