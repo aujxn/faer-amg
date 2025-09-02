@@ -1,9 +1,4 @@
-use faer::{
-    dyn_stack::{MemBuffer, MemStack},
-    mat::Mat,
-    stats::prelude::*,
-    Col, Par,
-};
+use faer::{diag::Diag, mat::Mat, stats::prelude::*, Col};
 use faer_amg::decompositions::rand_svd::rand_svd;
 
 /// Generate test matrix A = U * Σ * V^T from random unitary matrices and exponentially decaying
@@ -42,21 +37,14 @@ fn generate_test_matrix(
 
 /// Calculate accuracy score based on recovered singular values and subspace alignment
 fn calculate_accuracy_score(
-    q: &Mat<f64>,
-    svd_result: &faer::linalg::solvers::Svd<f64>,
+    u_recovered: &Mat<f64>,
+    v_recovered: &Mat<f64>,
+    s_recovered: &Diag<f64>,
     u_ref: &Mat<f64>,
     v_ref: &Mat<f64>,
     sigma_ref: &Col<f64>,
     k: usize,
-) -> f64 {
-    // Get truncated approximation: A_k ≈ Q * U_tilde * Σ * V^T
-    let u_tilde = svd_result.U();
-    let s_recovered = svd_result.S();
-    let v_recovered = svd_result.V();
-
-    // Construct the recovered left singular vectors: U_recovered = Q * U_tilde
-    let u_recovered = q.as_ref() * u_tilde;
-
+) {
     // Calculate subspace alignment for U: ||U_ref^T * U_recovered||_F^2 / rank
     let u_projection = u_ref.as_ref().subcols(0, k).transpose() * u_recovered.as_ref();
     let u_alignment = u_projection.squared_norm_l2() / k as f64;
@@ -93,7 +81,8 @@ fn calculate_accuracy_score(
 
     // Combined score: geometric mean of alignments weighted by singular value recovery
     let subspace_score = (u_alignment * v_alignment).sqrt();
-    subspace_score * sigma_ratio
+    let accuracy = subspace_score * sigma_ratio;
+    println!("Accuracy Score: {:.4} / 1.0", accuracy);
 }
 
 fn main() {
@@ -111,22 +100,7 @@ fn main() {
     // Generates test matrix with a manufactured solution
     let (a, u_ref, v_ref, sigma_ref) = generate_test_matrix(m, n, decay_rate);
 
-    // Compute randomized SVD using the matrix directly (Mat<f64> implements BiLinOp)
-    let par = Par::Seq;
-    let stack_req = faer::dyn_stack::StackReq::new::<f64>(m * n + k * (m + n));
-    let mut buf = MemBuffer::new(stack_req);
-    let mut stack = MemStack::new(&mut buf);
-
     println!("Computing randomized SVD...");
-    let result = rand_svd(&a, k, par, &mut stack);
-
-    match result {
-        Ok((q, svd_result)) => {
-            let accuracy = calculate_accuracy_score(&q, &svd_result, &u_ref, &v_ref, &sigma_ref, k);
-            println!("Accuracy Score: {:.4} / 1.0", accuracy);
-        }
-        Err(e) => {
-            println!("Randomized SVD failed: {:?}", e);
-        }
-    }
+    let (u, s, v) = rand_svd(&a, k);
+    calculate_accuracy_score(&u, &v, &s, &u_ref, &v_ref, &sigma_ref, k);
 }
