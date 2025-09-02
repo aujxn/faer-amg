@@ -79,7 +79,7 @@ impl<T: RealField> MultiGrid<T> {
         let mut work = Mat::zeros(v.nrows(), v.ncols());
         let op = &self.operators[level];
 
-        smooth(v.rb_mut(), f, op.clone(), smoother.clone(), par, stack, 1);
+        forward_smooth(v.rb_mut(), f, op.clone(), smoother.clone(), par, stack, 1);
         if DEBUG {
             op.apply(work.rb_mut(), v.as_ref(), par, stack);
             work = f - work.rb();
@@ -107,7 +107,7 @@ impl<T: RealField> MultiGrid<T> {
 
             interp.apply(work.rb_mut(), v_coarse.as_ref(), par, stack);
             v += &work;
-            smooth(v.rb_mut(), f, op.clone(), smoother.clone(), par, stack, 1);
+            backward_smooth(v.rb_mut(), f, op.clone(), smoother.clone(), par, stack, 1);
             if DEBUG {
                 op.apply(work.rb_mut(), v.as_ref(), par, stack);
                 work = f - work.rb();
@@ -121,7 +121,7 @@ impl<T: RealField> MultiGrid<T> {
     }
 }
 
-fn smooth<T: RealField>(
+fn forward_smooth<T: RealField>(
     x: MatMut<T>,
     b: MatRef<T>,
     op: Arc<dyn LinOp<T>>,
@@ -131,17 +131,33 @@ fn smooth<T: RealField>(
     max_iter: usize,
 ) {
     let mut work = Mat::zeros(x.nrows(), x.ncols());
-    let mut iter = 0;
     let mut x = x;
-    loop {
+    // first iteration of forward `x` is 0 so residual is `b`
+    pc.apply(x.rb_mut(), b, par, stack);
+    for _ in 1..max_iter {
         op.apply(work.rb_mut(), x.rb(), par, stack);
         let mut r = b - &work;
-        iter += 1;
         pc.apply_in_place(r.rb_mut(), par, stack);
         x += r;
-        if iter == max_iter {
-            break;
-        }
+    }
+}
+
+fn backward_smooth<T: RealField>(
+    x: MatMut<T>,
+    b: MatRef<T>,
+    op: Arc<dyn LinOp<T>>,
+    pc: Arc<dyn BiPrecond<T>>,
+    par: Par,
+    stack: &mut MemStack,
+    max_iter: usize,
+) {
+    let mut work = Mat::zeros(x.nrows(), x.ncols());
+    let mut x = x;
+    for _ in 0..max_iter {
+        op.apply(work.rb_mut(), x.rb(), par, stack);
+        let mut r = b - &work;
+        pc.transpose_apply_in_place(r.rb_mut(), par, stack);
+        x += r;
     }
 }
 
@@ -155,14 +171,14 @@ impl<T: RealField> LinOp<T> for MultiGrid<T> {
 
     fn nrows(&self) -> usize {
         if self.operators.is_empty() {
-            panic!("Cannot determine dimension of partially uninitialized MultiGrid.");
+            unreachable!("Cannot determine dimension of partially uninitialized MultiGrid.");
         }
         self.operators[0].nrows()
     }
 
     fn ncols(&self) -> usize {
         if self.operators.is_empty() {
-            panic!("Cannot determine dimension of partially uninitialized MultiGrid.");
+            unreachable!("Cannot determine dimension of partially uninitialized MultiGrid.");
         }
         self.operators[0].ncols()
     }
