@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use faer::{
     dyn_stack::{MemStack, StackReq},
-    matrix_free::{BiPrecond, LinOp, Precond},
+    matrix_free::{BiLinOp, BiPrecond, LinOp, Precond},
     reborrow::*,
     Mat, MatMut, MatRef, Par,
 };
@@ -146,7 +146,7 @@ fn smooth<T: RealField>(
 }
 
 impl<T: RealField> LinOp<T> for MultiGrid<T> {
-    // TODO: remove allocations in apply and learn how to use this stack
+    // TODO: low level API
     fn apply_scratch(&self, rhs_ncols: usize, par: Par) -> StackReq {
         let _rhs_ncols = rhs_ncols;
         let _par = par;
@@ -179,19 +179,35 @@ impl<T: RealField> LinOp<T> for MultiGrid<T> {
     }
 }
 
-impl<T: RealField> Precond<T> for MultiGrid<T> {
-    fn apply_in_place_scratch(&self, rhs_ncols: usize, par: Par) -> StackReq {
-        let _rhs_ncols = rhs_ncols;
-        let _par = par;
-        StackReq::EMPTY
+impl<T: RealField> BiLinOp<T> for MultiGrid<T> {
+    fn transpose_apply_scratch(&self, rhs_ncols: usize, par: Par) -> StackReq {
+        // TODO : only symmetric multigrid
+        self.apply_scratch(rhs_ncols, par)
     }
-    fn apply_in_place(&self, rhs: MatMut<'_, T>, par: Par, stack: &mut MemStack) {
-        let mut f = Mat::zeros(rhs.nrows(), rhs.ncols());
-        self.apply(f.rb_mut(), rhs.rb(), par, stack);
-        let mut rhs = rhs;
-        rhs.copy_from(f);
+
+    fn transpose_apply(
+        &self,
+        out: MatMut<'_, T>,
+        rhs: MatRef<'_, T>,
+        par: Par,
+        stack: &mut MemStack,
+    ) {
+        // TODO : only symmetric multigrid
+        self.apply(out, rhs, par, stack);
     }
-    fn conj_apply_in_place(&self, rhs: MatMut<'_, T>, par: Par, stack: &mut MemStack) {
-        self.apply_in_place(rhs, par, stack);
+
+    fn adjoint_apply(
+        &self,
+        out: MatMut<'_, T>,
+        rhs: MatRef<'_, T>,
+        par: Par,
+        stack: &mut MemStack,
+    ) {
+        // TODO : only symmetric multigrid
+        self.conj_apply(out, rhs, par, stack);
     }
 }
+
+// TODO: auto impl are fine for now but custom would be better
+impl<T: RealField> Precond<T> for MultiGrid<T> {}
+impl<T: RealField> BiPrecond<T> for MultiGrid<T> {}
