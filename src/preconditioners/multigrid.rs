@@ -188,7 +188,13 @@ impl LinOp<f64> for MultiGrid {
         self.init_cycle(out, rhs, par, stack);
     }
 
-    fn conj_apply(&self, out: MatMut<'_, f64>, rhs: MatRef<'_, f64>, par: Par, stack: &mut MemStack) {
+    fn conj_apply(
+        &self,
+        out: MatMut<'_, f64>,
+        rhs: MatRef<'_, f64>,
+        par: Par,
+        stack: &mut MemStack,
+    ) {
         // TODO: only real multigrid for now
         self.apply(out, rhs, par, stack);
     }

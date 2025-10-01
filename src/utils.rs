@@ -1,4 +1,13 @@
-use faer::sparse::SparseRowMat;
+use std::{
+    fs::File,
+    io::{BufRead, BufReader},
+    path::{Path, PathBuf},
+};
+
+use faer::{
+    sparse::{SparseRowMat, Triplet},
+    Mat,
+};
 
 pub fn mats_are_equal(left: &SparseRowMat<usize, f64>, right: &SparseRowMat<usize, f64>) -> bool {
     let l_shape = left.shape();
@@ -26,4 +35,287 @@ pub fn mats_are_equal(left: &SparseRowMat<usize, f64>, right: &SparseRowMat<usiz
         }
     }
     true
+}
+
+#[derive(Debug)]
+pub struct MfemLinearSystem {
+    pub matrix: SparseRowMat<usize, f64>,
+    pub rhs: Mat<f64>,
+    pub coords: Mat<f64>,
+    pub boundary_indices: Vec<usize>,
+}
+
+pub fn load_mfem_linear_system<P: AsRef<Path>>(
+    dir: P,
+    delete_boundary: bool,
+) -> Result<MfemLinearSystem, Box<dyn std::error::Error>> {
+    let dir = dir.as_ref();
+    let matrix_path = find_unique_file_with_extension(dir, "mtx")?;
+    let boundary_path = find_unique_file_with_extension(dir, "bdy")?;
+    let coords_path = find_unique_file_with_extension(dir, "coords")?;
+    let rhs_path = find_unique_file_with_extension(dir, "rhs")?;
+
+    let mut boundary_indices = load_boundary_indices(&boundary_path)?;
+    boundary_indices.sort_unstable();
+    boundary_indices.dedup();
+
+    let (nrows, ncols, triplets) = load_matrix_triplets(&matrix_path)?;
+    if nrows != ncols {
+        return Err("The MFEM loader currently supports only square matrices".into());
+    }
+
+    let coords_data = load_dense_rows(&coords_path)?;
+    if coords_data.len() != nrows {
+        return Err(format!(
+            "Coordinate rows ({}) must match matrix dimension ({})",
+            coords_data.len(),
+            nrows
+        )
+        .into());
+    }
+
+    let rhs_flat = load_rhs_values(&rhs_path)?;
+    if rhs_flat.len() % nrows != 0 {
+        return Err(format!(
+            "RHS length ({}) must be a multiple of the matrix dimension ({})",
+            rhs_flat.len(),
+            nrows
+        )
+        .into());
+    }
+    let rhs_cols = rhs_flat.len() / nrows;
+    let mut rhs_data = Vec::with_capacity(nrows);
+    for row in 0..nrows {
+        let mut row_vals = Vec::with_capacity(rhs_cols);
+        for col in 0..rhs_cols {
+            row_vals.push(rhs_flat[col * nrows + row]);
+        }
+        rhs_data.push(row_vals);
+    }
+
+    let (matrix, selection) = if delete_boundary {
+        remove_boundary_from_triplets(nrows, &boundary_indices, &triplets)?
+    } else {
+        let matrix = build_sparse_row_mat(nrows, ncols, &triplets)?;
+        let selection = (0..nrows).collect();
+        (matrix, selection)
+    };
+
+    let rhs = build_mat_from_rows(&rhs_data, &selection)?;
+    let coords = build_mat_from_rows(&coords_data, &selection)?;
+
+    Ok(MfemLinearSystem {
+        matrix,
+        rhs,
+        coords,
+        boundary_indices,
+    })
+}
+
+fn find_unique_file_with_extension(
+    dir: &Path,
+    extension: &str,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let mut candidates = Vec::new();
+    for entry in dir.read_dir()? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let ext = path.extension().and_then(|ext| ext.to_str());
+        if ext
+            .map(|ext| ext.eq_ignore_ascii_case(extension))
+            .unwrap_or(false)
+        {
+            candidates.push(path);
+        }
+    }
+
+    match candidates.len() {
+        1 => Ok(candidates.remove(0)),
+        0 => Err(format!(
+            "No file with extension .{} found in {}",
+            extension,
+            dir.display()
+        )
+        .into()),
+        _ => Err(format!(
+            "Multiple files with extension .{} found in {}",
+            extension,
+            dir.display()
+        )
+        .into()),
+    }
+}
+
+fn load_boundary_indices(path: &Path) -> Result<Vec<usize>, Box<dyn std::error::Error>> {
+    let file = File::open(path)?;
+    let mut lines = BufReader::new(file).lines();
+
+    let expected_count: usize = lines
+        .next()
+        .ok_or_else(|| format!("Boundary file {} is empty", path.display()))??
+        .trim()
+        .parse()?;
+
+    let mut indices = Vec::with_capacity(expected_count);
+    for line in lines {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        indices.push(trimmed.parse()?);
+    }
+
+    if indices.len() != expected_count {
+        return Err(format!(
+            "Boundary file {} expected {} entries but found {}",
+            path.display(),
+            expected_count,
+            indices.len()
+        )
+        .into());
+    }
+
+    Ok(indices)
+}
+
+fn load_dense_rows(path: &Path) -> Result<Vec<Vec<f64>>, Box<dyn std::error::Error>> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut data = Vec::new();
+
+    for line in reader.lines() {
+        let line = line?;
+        let values: Vec<f64> = line
+            .split_whitespace()
+            .map(str::parse)
+            .collect::<Result<_, _>>()?;
+        if values.is_empty() {
+            continue;
+        }
+        data.push(values);
+    }
+
+    Ok(data)
+}
+
+fn load_rhs_values(path: &Path) -> Result<Vec<f64>, Box<dyn std::error::Error>> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut values = Vec::new();
+
+    for line in reader.lines() {
+        let line = line?;
+        for item in line.split_whitespace() {
+            values.push(item.parse()?);
+        }
+    }
+
+    Ok(values)
+}
+
+fn build_sparse_row_mat(
+    nrows: usize,
+    ncols: usize,
+    triplets: &[(usize, usize, f64)],
+) -> Result<SparseRowMat<usize, f64>, Box<dyn std::error::Error>> {
+    let triplets: Vec<Triplet<usize, usize, f64>> = triplets
+        .iter()
+        .map(|&(row, col, val)| Triplet::new(row, col, val))
+        .collect();
+    Ok(SparseRowMat::try_new_from_triplets(
+        nrows, ncols, &triplets,
+    )?)
+}
+
+fn remove_boundary_from_triplets(
+    nrows: usize,
+    boundary_indices: &[usize],
+    triplets: &[(usize, usize, f64)],
+) -> Result<(SparseRowMat<usize, f64>, Vec<usize>), Box<dyn std::error::Error>> {
+    let mut is_boundary = vec![false; nrows];
+    for &idx in boundary_indices {
+        if idx >= nrows {
+            return Err(format!(
+                "Boundary index {} out of range for matrix of size {}",
+                idx, nrows
+            )
+            .into());
+        }
+        is_boundary[idx] = true;
+    }
+
+    let selection: Vec<usize> = (0..nrows).filter(|&i| !is_boundary[i]).collect();
+    let mut old_to_new = vec![None; nrows];
+    for (new_idx, &old_idx) in selection.iter().enumerate() {
+        old_to_new[old_idx] = Some(new_idx);
+    }
+
+    let mut filtered = Vec::with_capacity(triplets.len());
+    for &(row, col, val) in triplets.iter() {
+        if let (Some(new_row), Some(new_col)) = (old_to_new[row], old_to_new[col]) {
+            filtered.push(Triplet::new(new_row, new_col, val));
+        }
+    }
+
+    let dim = selection.len();
+    let matrix = SparseRowMat::try_new_from_triplets(dim, dim, &filtered)?;
+    Ok((matrix, selection))
+}
+
+fn build_mat_from_rows(
+    data: &[Vec<f64>],
+    selection: &[usize],
+) -> Result<Mat<f64>, Box<dyn std::error::Error>> {
+    if selection.is_empty() {
+        return Ok(Mat::zeros(0, 0));
+    }
+
+    let ncols = data
+        .get(selection[0])
+        .map(|row| row.len())
+        .ok_or_else(|| "Selection references missing row".to_string())?;
+
+    for &row_idx in selection {
+        let row = data
+            .get(row_idx)
+            .ok_or_else(|| format!("Row {} missing in dense data", row_idx))?;
+        if row.len() != ncols {
+            return Err("Inconsistent column counts in dense data".into());
+        }
+    }
+
+    let nrows = selection.len();
+    Ok(Mat::from_fn(nrows, ncols, |i, j| data[selection[i]][j]))
+}
+
+fn load_matrix_triplets(
+    path: &Path,
+) -> Result<(usize, usize, Vec<(usize, usize, f64)>), Box<dyn std::error::Error>> {
+    let mtx_data = matrix_market_rs::MtxData::<f64, 2>::from_file(path)?;
+    let (nrows, ncols, coords, vals, symmetry) = match mtx_data {
+        matrix_market_rs::MtxData::Sparse([nrows, ncols], coords, vals, symmetry) => {
+            (nrows, ncols, coords, vals, symmetry)
+        }
+        _ => return Err("Only sparse Matrix Market matrices are supported".into()),
+    };
+
+    let mut triplets = Vec::with_capacity(coords.len());
+    let symmetric = matches!(symmetry, matrix_market_rs::SymInfo::Symmetric);
+
+    for (idx, [row, col]) in coords.iter().copied().enumerate() {
+        let value = vals[idx];
+        if value == 0.0 {
+            continue;
+        }
+        triplets.push((row, col, value));
+        if symmetric && row != col {
+            triplets.push((col, row, value));
+        }
+    }
+
+    Ok((nrows, ncols, triplets))
 }

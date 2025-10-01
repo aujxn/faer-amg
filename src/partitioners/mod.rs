@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, sync::Arc};
 
 use faer::{
     sparse::{SparseRowMat, SparseRowMatRef},
-    Col, ColRef,
+    Col, ColRef, Mat, MatRef,
 };
 use log::info;
 use rayon::iter::{IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator};
@@ -29,6 +29,10 @@ impl Partition {
 
     pub fn cf(&self) -> f64 {
         self.node_to_agg.len() as f64 / self.agg_to_node.len() as f64
+    }
+
+    pub fn node_assignments(&self) -> &[usize] {
+        &self.node_to_agg
     }
 
     pub fn info(&self) {
@@ -155,7 +159,7 @@ impl Partition {
 
 pub struct PartitionBuilder {
     pub mat: Arc<SparseRowMat<usize, f64>>,
-    pub near_null: Col<f64>,
+    pub near_null: Mat<f64>,
     pub coarsening_factor: f64,
     pub agg_size_penalty: f64,
     pub max_agg_size: Option<usize>,
@@ -166,7 +170,7 @@ pub struct PartitionBuilder {
 impl PartitionBuilder {
     pub fn new(
         mat: Arc<SparseRowMat<usize, f64>>,
-        near_null: Col<f64>,
+        near_null: Mat<f64>,
         coarsening_factor: f64,
         agg_size_penalty: f64,
         max_agg_size: Option<usize>,
@@ -185,29 +189,36 @@ impl PartitionBuilder {
     }
 
     pub fn build(&self) -> Partition {
-        let strength =
+        let base_strength =
             AdjacencyList::new_strength_graph(self.mat.as_ref().as_ref(), self.near_null.as_ref());
-        let partitioner = modularity::ModularityPartitioner::new(
+        let mut partitioner = modularity::ModularityPartitioner::new(
             self.mat.clone(),
-            strength,
+            base_strength.clone(),
             self.coarsening_factor,
             self.agg_size_penalty,
         );
 
-        partitioner.modularity()
+        let base_row_sums = partitioner.row_sums.clone();
+        partitioner.modularity();
+        partitioner.improve(self.max_refinement_iters, base_strength, base_row_sums);
+        partitioner.into_partition()
     }
 }
 
+#[derive(Debug, Clone)]
 struct AdjacencyList {
     nodes: Vec<Vec<(usize, f64)>>,
 }
 
 impl AdjacencyList {
-    pub fn new_strength_graph(mat: SparseRowMatRef<usize, f64>, near_null: ColRef<f64>) -> Self {
+    pub fn new_strength_graph(mat: SparseRowMatRef<usize, f64>, near_null: MatRef<f64>) -> Self {
         let mut nodes = vec![Vec::new(); mat.ncols()];
         for triplet in mat.triplet_iter() {
+            let mut strength = 0.0;
             if triplet.row != triplet.col {
-                let strength = -near_null[triplet.row] * triplet.val * near_null[triplet.col];
+                for vec in near_null.col_iter() {
+                    strength += -vec[triplet.row] * triplet.val * vec[triplet.col];
+                }
                 nodes[triplet.row].push((triplet.col, strength));
             }
         }
