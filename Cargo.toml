@@ -2,7 +2,24 @@
 name = "faer-amg"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+description = "Adaptive smoothed aggregation algebraic multigrid preconditioner for numerical linear algebra applications"
 
 [dependencies]
-faer = { path = "../faer-rs/faer", version = "0.22"}
+#faer = { path = "../faer-rs/faer", version = "0.22"}
+faer = "0.23"
 faer-traits = { path = "../faer-rs/faer-traits", version = "0.22" }
+log = "0.4.28"
+rayon = "1.11.0"
+
+[profile.dev]
+codegen-units = 256
+opt-level = 3
+debug = true
+debug-assertions = true
+overflow-checks = true
+
+[profile.release]
+codegen-units = 1
+opt-level = 3
+debug = true

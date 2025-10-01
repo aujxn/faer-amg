@@ -2,10 +2,12 @@ use std::{collections::BTreeSet, sync::Arc};
 
 use faer::{
     sparse::{SparseRowMat, SparseRowMatRef},
-    ColRef, Mat,
+    Col, ColRef,
 };
+use log::info;
+use rayon::iter::{IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator};
 
-pub mod modularity;
+mod modularity;
 
 // NOTE: for now no generics, will refactor to fully generic interfaces when API stabilizes...
 
@@ -16,10 +18,146 @@ pub struct Partition {
     agg_to_node: Vec<BTreeSet<usize>>,
 }
 
+impl Partition {
+    pub fn naggs(&self) -> usize {
+        self.agg_to_node.len()
+    }
+
+    pub fn nnodes(&self) -> usize {
+        self.node_to_agg.len()
+    }
+
+    pub fn cf(&self) -> f64 {
+        self.node_to_agg.len() as f64 / self.agg_to_node.len() as f64
+    }
+
+    pub fn info(&self) {
+        let mut max_agg = usize::MIN;
+        let mut min_agg = usize::MAX;
+        for agg in self.agg_to_node.iter() {
+            if agg.len() > max_agg {
+                max_agg = agg.len();
+            }
+            if agg.len() < min_agg {
+                min_agg = agg.len();
+            }
+        }
+        info!(
+            "Partition has {} aggs ({:.2} avg size) with min size of {} and max size of {}",
+            self.agg_to_node.len(),
+            self.node_to_agg.len() as f64 / self.agg_to_node.len() as f64,
+            min_agg,
+            max_agg
+        );
+    }
+    pub fn singleton(mat: Arc<SparseRowMat<usize, f64>>) -> Self {
+        let node_to_agg = (0..mat.nrows()).collect();
+        let agg_to_node = (0..mat.nrows()).map(|i| BTreeSet::from([i])).collect();
+        Self {
+            mat,
+            node_to_agg,
+            agg_to_node,
+        }
+    }
+
+    pub fn update_node_to_agg(&mut self) {
+        for (agg_id, agg) in self.agg_to_node.iter().enumerate() {
+            for idx in agg.iter().copied() {
+                self.node_to_agg[idx] = agg_id;
+            }
+        }
+    }
+
+    pub fn update_agg_to_node(&mut self) {
+        let n_aggs: usize = self
+            .node_to_agg
+            .iter()
+            .copied()
+            .max()
+            .expect("You tried to update an empty partition");
+        let mut new_aggs = vec![BTreeSet::new(); n_aggs + 1];
+        for (node_id, agg_id) in self.node_to_agg.iter().copied().enumerate() {
+            new_aggs[agg_id].insert(node_id);
+        }
+        self.agg_to_node = new_aggs;
+    }
+
+    pub fn from_node_to_agg(mat: Arc<SparseRowMat<usize, f64>>, node_to_agg: Vec<usize>) -> Self {
+        let mut new_part = Self {
+            mat,
+            agg_to_node: Vec::new(),
+            node_to_agg,
+        };
+        new_part.update_agg_to_node();
+        new_part
+    }
+
+    pub fn from_agg_to_node(
+        mat: Arc<SparseRowMat<usize, f64>>,
+        agg_to_node: Vec<BTreeSet<usize>>,
+    ) -> Self {
+        let mut new_part = Self {
+            mat,
+            agg_to_node,
+            node_to_agg: Vec::new(),
+        };
+        new_part.update_node_to_agg();
+        new_part
+    }
+
+    pub fn pairwise_merge(&mut self, pairs: &Vec<(usize, usize)>, unmatched: &Vec<usize>) {
+        // NOTE: Could be par with unsafe
+        let pair_iter = pairs.iter().copied().map(|(agg_i, agg_j)| {
+            let a = &self.agg_to_node[agg_i];
+            let b = &self.agg_to_node[agg_j];
+            debug_assert!(a.is_disjoint(b));
+            a.union(b).cloned().collect()
+        });
+        let singleton_iter = unmatched
+            .iter()
+            .copied()
+            .map(|agg_i| self.agg_to_node[agg_i].clone());
+
+        let new_aggs = pair_iter.chain(singleton_iter).collect();
+
+        self.agg_to_node = new_aggs;
+        self.update_node_to_agg();
+    }
+
+    pub fn compose(&mut self, other: &Partition) {
+        #[cfg(debug_assertions)]
+        self.validate();
+        #[cfg(debug_assertions)]
+        other.validate();
+        assert_eq!(self.agg_to_node.len(), other.node_to_agg.len());
+        let mut new_agg_to_node = vec![BTreeSet::new(); other.agg_to_node.len()];
+        for (i, agg_id) in self.node_to_agg.iter_mut().enumerate() {
+            *agg_id = other.node_to_agg[*agg_id];
+            new_agg_to_node[*agg_id].insert(i);
+        }
+        self.agg_to_node = new_agg_to_node;
+        #[cfg(debug_assertions)]
+        self.validate();
+    }
+
+    pub fn validate(&self) {
+        let mut visited = vec![false; self.node_to_agg.len()];
+        for (agg_id, agg) in self.agg_to_node.iter().enumerate() {
+            for node_id in agg.iter().copied() {
+                assert_eq!(agg_id, self.node_to_agg[node_id]);
+                assert!(!visited[node_id]);
+                visited[node_id] = true;
+            }
+        }
+        assert!(visited.into_iter().all(|visited| visited));
+    }
+}
+
 pub struct PartitionBuilder {
     pub mat: Arc<SparseRowMat<usize, f64>>,
-    pub near_nullspace: Arc<Mat<f64>>,
+    pub near_null: Col<f64>,
     pub coarsening_factor: f64,
+    pub agg_size_penalty: f64,
     pub max_agg_size: Option<usize>,
     pub min_agg_size: Option<usize>,
     pub max_refinement_iters: usize,
@@ -28,26 +166,35 @@ pub struct PartitionBuilder {
 impl PartitionBuilder {
     pub fn new(
         mat: Arc<SparseRowMat<usize, f64>>,
-        near_nullspace: Arc<Mat<f64>>,
+        near_null: Col<f64>,
         coarsening_factor: f64,
+        agg_size_penalty: f64,
         max_agg_size: Option<usize>,
         min_agg_size: Option<usize>,
         max_refinement_iters: usize,
     ) -> Self {
         Self {
             mat,
-            near_nullspace,
+            near_null,
             coarsening_factor,
+            agg_size_penalty,
             max_agg_size,
             min_agg_size,
             max_refinement_iters,
         }
     }
-}
 
-impl PartitionBuilder {
     pub fn build(&self) -> Partition {
-        unimplemented!()
+        let strength =
+            AdjacencyList::new_strength_graph(self.mat.as_ref().as_ref(), self.near_null.as_ref());
+        let partitioner = modularity::ModularityPartitioner::new(
+            self.mat.clone(),
+            strength,
+            self.coarsening_factor,
+            self.agg_size_penalty,
+        );
+
+        partitioner.modularity()
     }
 }
 
@@ -71,10 +218,9 @@ impl AdjacencyList {
     pub fn pairwise_merge(&mut self, pairs: &Vec<(usize, usize)>, unmatched: &Vec<usize>) {
         let fine_n = self.nodes.len();
         let pairs_n = pairs.len();
-        let coarse_n = fine_n - pairs_n;
-        let mut merged_nodes = Vec::with_capacity(coarse_n);
 
         let mut agg_ids = vec![0; fine_n];
+        // NOTE: could be par with unsafe
         for (agg_id, (i, j)) in pairs.iter().enumerate() {
             agg_ids[*i] = agg_id;
             agg_ids[*j] = agg_id;
@@ -85,38 +231,31 @@ impl AdjacencyList {
 
         self.map_indices(&agg_ids);
 
-        // TODO: par iter
-        for (i, j) in pairs.iter() {
-            merged_nodes.push(self.merge_pair(*i, *j));
-        }
-
-        for i in unmatched.iter() {
-            let mut swap = Vec::new();
-            std::mem::swap(&mut swap, &mut self.nodes[*i]);
-            merged_nodes.push(swap);
-        }
-
-        self.nodes = merged_nodes;
+        // NOTE: could avoid clone and re-use old memory with some opt here
+        self.nodes = pairs
+            .par_iter()
+            .copied()
+            .map(|(i, j)| self.merge_pair(i, j))
+            .chain(unmatched.par_iter().copied().map(|i| self.nodes[i].clone()))
+            .collect();
     }
 
     pub fn aggregate(&mut self, partition: &Partition) {
         self.map_indices(&partition.node_to_agg);
-        // TODO: par iter
         self.nodes = partition
             .agg_to_node
-            .iter()
+            .par_iter()
             .map(|agg| self.merge_agg(agg))
             .collect();
     }
 
     fn map_indices(&mut self, agg_ids: &Vec<usize>) {
-        // TODO: par iter
-        for neighbors in self.nodes.iter_mut() {
+        self.nodes.par_iter_mut().for_each(|neighbors| {
             for edge in neighbors.iter_mut() {
                 edge.0 = agg_ids[edge.0];
             }
             neighbors.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        }
+        });
     }
 
     fn merge_pair(&self, i: usize, j: usize) -> Vec<(usize, f64)> {
