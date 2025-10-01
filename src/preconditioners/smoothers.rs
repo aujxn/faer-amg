@@ -7,69 +7,67 @@ use faer::{
         linalg::solvers::{Llt, SymbolicLlt},
         SparseRowMatRef,
     },
-    Index, MatMut, MatRef, Par,
-};
-use faer_traits::{
-    math_utils::{abs1, add, mul, recip, sqrt},
-    RealField,
+    MatMut, MatRef, Par,
 };
 
-pub type L2<T> = Diag<T>;
-pub type L1<T> = Diag<T>;
+pub type L2 = Diag<f64>;
+pub type L1 = Diag<f64>;
 
-pub fn new_l2<I: Index, T: RealField>(mat: &SparseRowMatRef<I, T>) -> L2<T> {
+pub fn new_l2(mat: &SparseRowMatRef<usize, f64>) -> L2 {
     let nrows = mat.nrows();
-    let diag_sqrt: Vec<T> = (0..nrows).map(|i| sqrt(mat.get(i, i).unwrap())).collect();
+    let diag_sqrt: Vec<f64> = (0..nrows)
+        .map(|i| mat.get(i, i).map(|v| v.sqrt()).unwrap())
+        .collect();
 
-    let mut l2_inverse: L2<T> = Diag::zeros(nrows);
+    let mut l2_inverse: L2 = Diag::zeros(nrows);
 
     for triplet in mat.triplet_iter() {
-        let scale: T = mul(&diag_sqrt[triplet.row], &recip(&diag_sqrt[triplet.col]));
-        l2_inverse[triplet.row] = add(&l2_inverse[triplet.row], &(abs1(triplet.val) * scale));
+        let scale = diag_sqrt[triplet.row] / diag_sqrt[triplet.col];
+        l2_inverse[triplet.row] += triplet.val.abs() * scale;
     }
 
     l2_inverse
         .column_vector_mut()
         .iter_mut()
-        .for_each(|d| *d = recip(d));
+        .for_each(|d| *d = 1.0 / *d);
     l2_inverse
 }
 
-pub fn new_l1<I: Index, T: RealField>(mat: &SparseRowMatRef<I, T>) -> L1<T> {
+pub fn new_l1(mat: &SparseRowMatRef<usize, f64>) -> L1 {
     let nrows = mat.nrows();
-    let mut l1_inverse: L1<T> = Diag::zeros(nrows);
+    let mut l1_inverse: L1 = Diag::zeros(nrows);
 
     for triplet in mat.triplet_iter() {
-        l1_inverse[triplet.row] = add(&l1_inverse[triplet.row], &abs1(triplet.val));
+        l1_inverse[triplet.row] += triplet.val.abs();
     }
 
     l1_inverse
         .column_vector_mut()
         .iter_mut()
-        .for_each(|d| *d = recip(d));
+        .for_each(|d| *d = 1.0 / *d);
     l1_inverse
 }
 
-pub fn new_jacobi<I: Index, T: RealField>(mat: &SparseRowMatRef<I, T>, omega: T) -> L1<T> {
+pub fn new_jacobi(mat: &SparseRowMatRef<usize, f64>, omega: f64) -> L1 {
     let nrows = mat.nrows();
-    let mut jacobi: L1<T> = Diag::zeros(nrows);
+    let mut jacobi: L1 = Diag::zeros(nrows);
 
     for (i, val) in jacobi.column_vector_mut().iter_mut().enumerate() {
-        *val = recip(mat.get(i, i).unwrap()).mul_by_ref(&omega);
+        *val = omega / *mat.get(i, i).unwrap();
     }
     jacobi
 }
 
 /// Cholesky solver abstraction that implements linear operator interface.
 #[derive(Clone, Debug)]
-pub struct CholeskySolve<I: Index, T: RealField> {
-    decomp: Llt<I, T>,
+pub struct CholeskySolve {
+    decomp: Llt<usize, f64>,
     size: usize,
 }
 
 // TODO: probably use low level API?
-impl<I: Index, T: RealField> CholeskySolve<I, T> {
-    pub fn new(sym_mat: SparseRowMatRef<I, T>) -> Self {
+impl CholeskySolve {
+    pub fn new(sym_mat: SparseRowMatRef<usize, f64>) -> Self {
         let symb_llt =
             SymbolicLlt::try_new(sym_mat.symbolic().transpose(), faer::Side::Upper).unwrap();
         let decomp =
@@ -79,7 +77,7 @@ impl<I: Index, T: RealField> CholeskySolve<I, T> {
     }
 }
 
-impl<I: Index, T: RealField> LinOp<T> for CholeskySolve<I, T> {
+impl LinOp<f64> for CholeskySolve {
     // TODO: remove allocations in apply and learn how to use this stack
     fn apply_scratch(&self, rhs_ncols: usize, par: Par) -> StackReq {
         let _rhs_ncols = rhs_ncols;
@@ -95,7 +93,7 @@ impl<I: Index, T: RealField> LinOp<T> for CholeskySolve<I, T> {
         self.size
     }
 
-    fn apply(&self, out: MatMut<'_, T>, rhs: MatRef<'_, T>, par: Par, stack: &mut MemStack) {
+    fn apply(&self, out: MatMut<'_, f64>, rhs: MatRef<'_, f64>, par: Par, stack: &mut MemStack) {
         let _par = par;
         let _stack = stack;
         let mut out = out;
@@ -104,7 +102,13 @@ impl<I: Index, T: RealField> LinOp<T> for CholeskySolve<I, T> {
         self.decomp.solve_in_place_with_conj(faer::Conj::No, out);
     }
 
-    fn conj_apply(&self, out: MatMut<'_, T>, rhs: MatRef<'_, T>, par: Par, stack: &mut MemStack) {
+    fn conj_apply(
+        &self,
+        out: MatMut<'_, f64>,
+        rhs: MatRef<'_, f64>,
+        par: Par,
+        stack: &mut MemStack,
+    ) {
         let _par = par;
         let _stack = stack;
         let mut out = out;
@@ -114,14 +118,14 @@ impl<I: Index, T: RealField> LinOp<T> for CholeskySolve<I, T> {
     }
 }
 
-impl<I: Index, T: RealField> BiLinOp<T> for CholeskySolve<I, T> {
+impl BiLinOp<f64> for CholeskySolve {
     fn transpose_apply_scratch(&self, rhs_ncols: usize, par: Par) -> StackReq {
         self.apply_scratch(rhs_ncols, par)
     }
     fn transpose_apply(
         &self,
-        out: MatMut<'_, T>,
-        rhs: MatRef<'_, T>,
+        out: MatMut<'_, f64>,
+        rhs: MatRef<'_, f64>,
         par: Par,
         stack: &mut MemStack,
     ) {
@@ -129,8 +133,8 @@ impl<I: Index, T: RealField> BiLinOp<T> for CholeskySolve<I, T> {
     }
     fn adjoint_apply(
         &self,
-        out: MatMut<'_, T>,
-        rhs: MatRef<'_, T>,
+        out: MatMut<'_, f64>,
+        rhs: MatRef<'_, f64>,
         par: Par,
         stack: &mut MemStack,
     ) {
@@ -138,32 +142,32 @@ impl<I: Index, T: RealField> BiLinOp<T> for CholeskySolve<I, T> {
     }
 }
 
-impl<I: Index, T: RealField> Precond<T> for CholeskySolve<I, T> {
+impl Precond<f64> for CholeskySolve {
     fn apply_in_place_scratch(&self, rhs_ncols: usize, par: Par) -> StackReq {
         let _rhs_ncols = rhs_ncols;
         let _par = par;
         StackReq::EMPTY
     }
-    fn apply_in_place(&self, rhs: MatMut<'_, T>, par: Par, stack: &mut MemStack) {
+    fn apply_in_place(&self, rhs: MatMut<'_, f64>, par: Par, stack: &mut MemStack) {
         let _par = par;
         let _stack = stack;
         self.decomp.solve_in_place_with_conj(faer::Conj::No, rhs);
     }
-    fn conj_apply_in_place(&self, rhs: MatMut<'_, T>, par: Par, stack: &mut MemStack) {
+    fn conj_apply_in_place(&self, rhs: MatMut<'_, f64>, par: Par, stack: &mut MemStack) {
         let _par = par;
         let _stack = stack;
         self.decomp.solve_in_place_with_conj(faer::Conj::Yes, rhs);
     }
 }
 
-impl<I: Index, T: RealField> BiPrecond<T> for CholeskySolve<I, T> {
+impl BiPrecond<f64> for CholeskySolve {
     fn transpose_apply_in_place_scratch(&self, rhs_ncols: usize, par: Par) -> StackReq {
         self.apply_in_place_scratch(rhs_ncols, par)
     }
-    fn transpose_apply_in_place(&self, rhs: MatMut<'_, T>, par: Par, stack: &mut MemStack) {
+    fn transpose_apply_in_place(&self, rhs: MatMut<'_, f64>, par: Par, stack: &mut MemStack) {
         self.apply_in_place(rhs, par, stack);
     }
-    fn adjoint_apply_in_place(&self, rhs: MatMut<'_, T>, par: Par, stack: &mut MemStack) {
+    fn adjoint_apply_in_place(&self, rhs: MatMut<'_, f64>, par: Par, stack: &mut MemStack) {
         self.conj_apply_in_place(rhs, par, stack);
     }
 }

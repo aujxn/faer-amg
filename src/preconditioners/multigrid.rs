@@ -6,23 +6,22 @@ use faer::{
     reborrow::*,
     Mat, MatMut, MatRef, Par,
 };
-use faer_traits::RealField;
 
 #[derive(Debug, Clone)]
-pub struct MultiGrid<T: RealField> {
-    operators: Vec<Arc<dyn LinOp<T> + Send>>,
-    smoothers: Vec<Arc<dyn BiPrecond<T> + Send>>,
-    interpolations: Vec<Arc<dyn LinOp<T> + Send>>,
-    restrictions: Vec<Arc<dyn LinOp<T> + Send>>,
+pub struct MultiGrid {
+    operators: Vec<Arc<dyn LinOp<f64> + Send>>,
+    smoothers: Vec<Arc<dyn BiPrecond<f64> + Send>>,
+    interpolations: Vec<Arc<dyn LinOp<f64> + Send>>,
+    restrictions: Vec<Arc<dyn LinOp<f64> + Send>>,
     cycle_type: usize,
 }
 
 const DEBUG: bool = false;
 
-impl<T: RealField> MultiGrid<T> {
+impl MultiGrid {
     pub fn new(
-        finest_op: Arc<dyn LinOp<T> + Send>,
-        smoother: Arc<dyn BiPrecond<T> + Send>,
+        finest_op: Arc<dyn LinOp<f64> + Send>,
+        smoother: Arc<dyn BiPrecond<f64> + Send>,
     ) -> Self {
         Self {
             operators: vec![finest_op],
@@ -40,10 +39,10 @@ impl<T: RealField> MultiGrid<T> {
 
     pub fn add_level(
         &mut self,
-        op: Arc<dyn LinOp<T> + Send>,
-        smoother: Arc<dyn BiPrecond<T> + Send>,
-        r: Arc<dyn LinOp<T> + Send>,
-        p: Arc<dyn LinOp<T> + Send>,
+        op: Arc<dyn LinOp<f64> + Send>,
+        smoother: Arc<dyn BiPrecond<f64> + Send>,
+        r: Arc<dyn LinOp<f64> + Send>,
+        p: Arc<dyn LinOp<f64> + Send>,
     ) {
         self.operators.push(op);
         self.smoothers.push(smoother);
@@ -53,8 +52,8 @@ impl<T: RealField> MultiGrid<T> {
 
     fn init_cycle(
         &self,
-        mut out: MatMut<'_, T>,
-        rhs: MatRef<'_, T>,
+        mut out: MatMut<'_, f64>,
+        rhs: MatRef<'_, f64>,
         par: Par,
         stack: &mut MemStack,
     ) {
@@ -65,8 +64,8 @@ impl<T: RealField> MultiGrid<T> {
 
     fn cycle(
         &self,
-        mut v: MatMut<'_, T>,
-        f: MatRef<'_, T>,
+        mut v: MatMut<'_, f64>,
+        f: MatRef<'_, f64>,
         level: usize,
         par: Par,
         stack: &mut MemStack,
@@ -121,11 +120,11 @@ impl<T: RealField> MultiGrid<T> {
     }
 }
 
-fn forward_smooth<T: RealField>(
-    x: MatMut<T>,
-    b: MatRef<T>,
-    op: Arc<dyn LinOp<T>>,
-    pc: Arc<dyn BiPrecond<T>>,
+fn forward_smooth(
+    x: MatMut<'_, f64>,
+    b: MatRef<'_, f64>,
+    op: Arc<dyn LinOp<f64>>,
+    pc: Arc<dyn BiPrecond<f64>>,
     par: Par,
     stack: &mut MemStack,
     max_iter: usize,
@@ -142,11 +141,11 @@ fn forward_smooth<T: RealField>(
     }
 }
 
-fn backward_smooth<T: RealField>(
-    x: MatMut<T>,
-    b: MatRef<T>,
-    op: Arc<dyn LinOp<T>>,
-    pc: Arc<dyn BiPrecond<T>>,
+fn backward_smooth(
+    x: MatMut<'_, f64>,
+    b: MatRef<'_, f64>,
+    op: Arc<dyn LinOp<f64>>,
+    pc: Arc<dyn BiPrecond<f64>>,
     par: Par,
     stack: &mut MemStack,
     max_iter: usize,
@@ -161,7 +160,7 @@ fn backward_smooth<T: RealField>(
     }
 }
 
-impl<T: RealField> LinOp<T> for MultiGrid<T> {
+impl LinOp<f64> for MultiGrid {
     // TODO: low level API
     fn apply_scratch(&self, rhs_ncols: usize, par: Par) -> StackReq {
         let _rhs_ncols = rhs_ncols;
@@ -183,19 +182,19 @@ impl<T: RealField> LinOp<T> for MultiGrid<T> {
         self.operators[0].ncols()
     }
 
-    fn apply(&self, out: MatMut<'_, T>, rhs: MatRef<'_, T>, par: Par, stack: &mut MemStack) {
+    fn apply(&self, out: MatMut<'_, f64>, rhs: MatRef<'_, f64>, par: Par, stack: &mut MemStack) {
         let mut out = out;
-        out.fill(T::zero());
+        out.fill(0.0);
         self.init_cycle(out, rhs, par, stack);
     }
 
-    fn conj_apply(&self, out: MatMut<'_, T>, rhs: MatRef<'_, T>, par: Par, stack: &mut MemStack) {
+    fn conj_apply(&self, out: MatMut<'_, f64>, rhs: MatRef<'_, f64>, par: Par, stack: &mut MemStack) {
         // TODO: only real multigrid for now
         self.apply(out, rhs, par, stack);
     }
 }
 
-impl<T: RealField> BiLinOp<T> for MultiGrid<T> {
+impl BiLinOp<f64> for MultiGrid {
     fn transpose_apply_scratch(&self, rhs_ncols: usize, par: Par) -> StackReq {
         // TODO : only symmetric multigrid
         self.apply_scratch(rhs_ncols, par)
@@ -203,8 +202,8 @@ impl<T: RealField> BiLinOp<T> for MultiGrid<T> {
 
     fn transpose_apply(
         &self,
-        out: MatMut<'_, T>,
-        rhs: MatRef<'_, T>,
+        out: MatMut<'_, f64>,
+        rhs: MatRef<'_, f64>,
         par: Par,
         stack: &mut MemStack,
     ) {
@@ -214,8 +213,8 @@ impl<T: RealField> BiLinOp<T> for MultiGrid<T> {
 
     fn adjoint_apply(
         &self,
-        out: MatMut<'_, T>,
-        rhs: MatRef<'_, T>,
+        out: MatMut<'_, f64>,
+        rhs: MatRef<'_, f64>,
         par: Par,
         stack: &mut MemStack,
     ) {
@@ -225,5 +224,5 @@ impl<T: RealField> BiLinOp<T> for MultiGrid<T> {
 }
 
 // TODO: auto impl are fine for now but custom would be better
-impl<T: RealField> Precond<T> for MultiGrid<T> {}
-impl<T: RealField> BiPrecond<T> for MultiGrid<T> {}
+impl Precond<f64> for MultiGrid {}
+impl BiPrecond<f64> for MultiGrid {}

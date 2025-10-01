@@ -8,11 +8,9 @@ use faer::prelude::*;
 use faer::reborrow::ReborrowMut;
 use faer::stats::prelude::*;
 use faer::stats::CwiseMatDistribution;
-use faer_traits::ComplexField;
-
-// TODO: Low level and generic implementations later...
-pub fn rand_svd_scratch<T: ComplexField>(
-    _op: impl BiLinOp<T>,
+// TODO: Low level implementation later...
+pub fn rand_svd_scratch(
+    _op: impl BiLinOp<f64>,
     _truncation_dim: usize,
     _oversample: usize,
 ) -> StackReq {

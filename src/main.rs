@@ -11,7 +11,6 @@ use faer::{
     sparse::{linalg::matmul::sparse_dense_matmul, SparseColMat, Triplet},
     Mat, MatMut, MatRef, Par,
 };
-use faer_traits::RealField;
 */
 
 fn main() {
