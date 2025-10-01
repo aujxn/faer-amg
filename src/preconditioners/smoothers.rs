@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use faer::{
     diag::Diag,
     dyn_stack::{MemStack, StackReq},
