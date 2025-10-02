@@ -45,15 +45,18 @@ pub struct MfemLinearSystem {
     pub boundary_indices: Vec<usize>,
 }
 
-pub fn load_mfem_linear_system<P: AsRef<Path>>(
+pub fn load_mfem_linear_system<P: AsRef<Path>, S: AsRef<Path>>(
     dir: P,
+    name: S,
     delete_boundary: bool,
 ) -> Result<MfemLinearSystem, Box<dyn std::error::Error>> {
     let dir = dir.as_ref();
-    let matrix_path = find_unique_file_with_extension(dir, "mtx")?;
-    let boundary_path = find_unique_file_with_extension(dir, "bdy")?;
-    let coords_path = find_unique_file_with_extension(dir, "coords")?;
-    let rhs_path = find_unique_file_with_extension(dir, "rhs")?;
+    let base_path = dir.join(name);
+
+    let matrix_path = ensure_named_file_exists(&base_path, "mtx")?;
+    let boundary_path = ensure_named_file_exists(&base_path, "bdy")?;
+    let coords_path = ensure_named_file_exists(&base_path, "coords")?;
+    let rhs_path = ensure_named_file_exists(&base_path, "rhs")?;
 
     let mut boundary_indices = load_boundary_indices(&boundary_path)?;
     boundary_indices.sort_unstable();
@@ -112,40 +115,15 @@ pub fn load_mfem_linear_system<P: AsRef<Path>>(
     })
 }
 
-fn find_unique_file_with_extension(
-    dir: &Path,
+fn ensure_named_file_exists(
+    base_path: &Path,
     extension: &str,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let mut candidates = Vec::new();
-    for entry in dir.read_dir()? {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let ext = path.extension().and_then(|ext| ext.to_str());
-        if ext
-            .map(|ext| ext.eq_ignore_ascii_case(extension))
-            .unwrap_or(false)
-        {
-            candidates.push(path);
-        }
-    }
-
-    match candidates.len() {
-        1 => Ok(candidates.remove(0)),
-        0 => Err(format!(
-            "No file with extension .{} found in {}",
-            extension,
-            dir.display()
-        )
-        .into()),
-        _ => Err(format!(
-            "Multiple files with extension .{} found in {}",
-            extension,
-            dir.display()
-        )
-        .into()),
+    let candidate = base_path.with_extension(extension);
+    if candidate.is_file() {
+        Ok(candidate)
+    } else {
+        Err(format!("Expected file {}", candidate.display()).into())
     }
 }
 

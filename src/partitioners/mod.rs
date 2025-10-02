@@ -162,8 +162,6 @@ pub struct PartitionBuilder {
     pub near_null: Mat<f64>,
     pub coarsening_factor: f64,
     pub agg_size_penalty: f64,
-    pub max_agg_size: Option<usize>,
-    pub min_agg_size: Option<usize>,
     pub max_refinement_iters: usize,
 }
 
@@ -173,8 +171,6 @@ impl PartitionBuilder {
         near_null: Mat<f64>,
         coarsening_factor: f64,
         agg_size_penalty: f64,
-        max_agg_size: Option<usize>,
-        min_agg_size: Option<usize>,
         max_refinement_iters: usize,
     ) -> Self {
         Self {
@@ -182,8 +178,6 @@ impl PartitionBuilder {
             near_null,
             coarsening_factor,
             agg_size_penalty,
-            max_agg_size,
-            min_agg_size,
             max_refinement_iters,
         }
     }
@@ -198,9 +192,8 @@ impl PartitionBuilder {
             self.agg_size_penalty,
         );
 
-        let base_row_sums = partitioner.row_sums.clone();
-        partitioner.modularity();
-        partitioner.improve(self.max_refinement_iters, base_strength, base_row_sums);
+        partitioner.partition();
+        partitioner.improve(self.max_refinement_iters);
         partitioner.into_partition()
     }
 }
@@ -224,6 +217,14 @@ impl AdjacencyList {
         }
 
         Self { nodes }
+    }
+
+    pub fn get(&self, node_i: usize, node_j: usize) -> f64 {
+        let neighborhood = &self.nodes[node_i];
+        match neighborhood.binary_search_by(|probe| probe.0.cmp(&node_j)) {
+            Ok(idx) => neighborhood[idx].1,
+            Err(_) => 0.0,
+        }
     }
 
     pub fn pairwise_merge(&mut self, pairs: &Vec<(usize, usize)>, unmatched: &Vec<usize>) {
