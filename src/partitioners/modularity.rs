@@ -17,7 +17,7 @@ enum AggSize {
 }
 
 pub struct ModularityPartitioner {
-    pub base_strength: AdjacencyList,
+    pub(crate) base_strength: AdjacencyList,
     strength: AdjacencyList,
     pub base_row_sums: Col<f64>,
     row_sums: Col<f64>,
@@ -28,7 +28,7 @@ pub struct ModularityPartitioner {
 }
 
 impl ModularityPartitioner {
-    pub fn new(
+    pub(crate) fn new(
         mat: Arc<SparseRowMat<usize, f64>>,
         strength: AdjacencyList,
         coarsening_factor: f64,

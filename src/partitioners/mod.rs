@@ -8,6 +8,7 @@ use log::info;
 use rayon::iter::{IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator};
 
 mod modularity;
+pub use modularity::ModularityPartitioner;
 
 // NOTE: for now no generics, will refactor to fully generic interfaces when API stabilizes...
 
@@ -155,6 +156,10 @@ impl Partition {
         }
         assert!(visited.into_iter().all(|visited| visited));
     }
+
+    pub fn aggregate_sizes(&self) -> Vec<usize> {
+        self.agg_to_node.iter().map(|agg| agg.len()).collect()
+    }
 }
 
 pub struct PartitionBuilder {
@@ -162,7 +167,7 @@ pub struct PartitionBuilder {
     pub near_null: Mat<f64>,
     pub coarsening_factor: f64,
     pub agg_size_penalty: f64,
-    pub max_refinement_iters: usize,
+    pub max_improvement_iters: usize,
 }
 
 impl PartitionBuilder {
@@ -171,35 +176,38 @@ impl PartitionBuilder {
         near_null: Mat<f64>,
         coarsening_factor: f64,
         agg_size_penalty: f64,
-        max_refinement_iters: usize,
+        max_improvement_iters: usize,
     ) -> Self {
         Self {
             mat,
             near_null,
             coarsening_factor,
             agg_size_penalty,
-            max_refinement_iters,
+            max_improvement_iters,
         }
     }
 
-    pub fn build(&self) -> Partition {
-        let base_strength =
+    pub fn create_partitioner(&self) -> ModularityPartitioner {
+        let strength =
             AdjacencyList::new_strength_graph(self.mat.as_ref().as_ref(), self.near_null.as_ref());
-        let mut partitioner = modularity::ModularityPartitioner::new(
+        ModularityPartitioner::new(
             self.mat.clone(),
-            base_strength.clone(),
+            strength,
             self.coarsening_factor,
             self.agg_size_penalty,
-        );
+        )
+    }
 
+    pub fn build(&self) -> Partition {
+        let mut partitioner = self.create_partitioner();
         partitioner.partition();
-        partitioner.improve(self.max_refinement_iters);
+        partitioner.improve(self.max_improvement_iters);
         partitioner.into_partition()
     }
 }
 
 #[derive(Debug, Clone)]
-struct AdjacencyList {
+pub(crate) struct AdjacencyList {
     nodes: Vec<Vec<(usize, f64)>>,
 }
 
