@@ -8,6 +8,7 @@ use faer::{
     sparse::{SparseRowMat, Triplet},
     Mat,
 };
+use sci_bevy_comm::{load_triangle_mesh_data, MeshGeometry};
 
 pub fn mats_are_equal(left: &SparseRowMat<usize, f64>, right: &SparseRowMat<usize, f64>) -> bool {
     let l_shape = left.shape();
@@ -37,12 +38,23 @@ pub fn mats_are_equal(left: &SparseRowMat<usize, f64>, right: &SparseRowMat<usiz
     true
 }
 
+#[derive(Debug, Clone)]
+pub struct MfemIndexMapping {
+    /// Maps original mesh vertex indices to solution vector indices (None for removed boundary nodes).
+    pub mesh_to_solution: Vec<Option<usize>>,
+    /// Maps solution vector indices back to the original mesh vertex indices.
+    pub solution_to_mesh: Vec<usize>,
+}
+
 #[derive(Debug)]
 pub struct MfemLinearSystem {
     pub matrix: SparseRowMat<usize, f64>,
     pub rhs: Mat<f64>,
     pub coords: Mat<f64>,
     pub boundary_indices: Vec<usize>,
+    pub mesh_geometry: Option<MeshGeometry>,
+    pub index_mapping: MfemIndexMapping,
+    pub original_dimension: usize,
 }
 
 pub fn load_mfem_linear_system<P: AsRef<Path>, S: AsRef<Path>>(
@@ -96,22 +108,33 @@ pub fn load_mfem_linear_system<P: AsRef<Path>, S: AsRef<Path>>(
         rhs_data.push(row_vals);
     }
 
-    let (matrix, selection) = if delete_boundary {
+    let (matrix, selection, mesh_to_solution) = if delete_boundary {
         remove_boundary_from_triplets(nrows, &boundary_indices, &triplets)?
     } else {
         let matrix = build_sparse_row_mat(nrows, ncols, &triplets)?;
         let selection = (0..nrows).collect();
-        (matrix, selection)
+        let mesh_to_solution = (0..nrows).map(Some).collect();
+        (matrix, selection, mesh_to_solution)
     };
 
     let rhs = build_mat_from_rows(&rhs_data, &selection)?;
     let coords = build_mat_from_rows(&coords_data, &selection)?;
+
+    let mesh_geometry = find_associated_vtk(&base_path)?
+        .map(|path| load_triangle_mesh_data(&path).map(|mesh| mesh.to_mesh_geometry()))
+        .transpose()?;
 
     Ok(MfemLinearSystem {
         matrix,
         rhs,
         coords,
         boundary_indices,
+        mesh_geometry,
+        index_mapping: MfemIndexMapping {
+            mesh_to_solution,
+            solution_to_mesh: selection.clone(),
+        },
+        original_dimension: nrows,
     })
 }
 
@@ -213,7 +236,8 @@ fn remove_boundary_from_triplets(
     nrows: usize,
     boundary_indices: &[usize],
     triplets: &[(usize, usize, f64)],
-) -> Result<(SparseRowMat<usize, f64>, Vec<usize>), Box<dyn std::error::Error>> {
+) -> Result<(SparseRowMat<usize, f64>, Vec<usize>, Vec<Option<usize>>), Box<dyn std::error::Error>>
+{
     let mut is_boundary = vec![false; nrows];
     for &idx in boundary_indices {
         if idx >= nrows {
@@ -241,7 +265,7 @@ fn remove_boundary_from_triplets(
 
     let dim = selection.len();
     let matrix = SparseRowMat::try_new_from_triplets(dim, dim, &filtered)?;
-    Ok((matrix, selection))
+    Ok((matrix, selection, old_to_new))
 }
 
 fn build_mat_from_rows(
@@ -296,4 +320,21 @@ fn load_matrix_triplets(
     }
 
     Ok((nrows, ncols, triplets))
+}
+
+fn find_associated_vtk(base_path: &Path) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
+    let Some(dataset_name) = base_path.file_name() else {
+        return Ok(None);
+    };
+
+    let mut current_dir = base_path.parent();
+    while let Some(dir) = current_dir {
+        let candidate = dir.join(dataset_name).with_extension("vtk");
+        if candidate.is_file() {
+            return Ok(Some(candidate));
+        }
+        current_dir = dir.parent();
+    }
+
+    Ok(None)
 }

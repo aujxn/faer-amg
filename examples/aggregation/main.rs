@@ -1,5 +1,4 @@
-use faer::Col;
-use faer::{sparse::SparseRowMat, stats::prelude::*, Mat};
+use faer::{sparse::SparseRowMat, stats::prelude::*, Col, ColRef, Mat};
 use indicatif::ProgressBar;
 use plotters::style::text_anchor::{HPos, Pos, VPos};
 use plotters::{data::Quartiles as PlottersQuartiles, drawing::DrawingAreaErrorKind, prelude::*};
@@ -9,7 +8,7 @@ use std::{
     error::Error,
     num::NonZeroUsize,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use faer_amg::{
@@ -17,7 +16,10 @@ use faer_amg::{
     preconditioners::smoothers::new_l1,
     utils::{load_mfem_linear_system, MfemLinearSystem},
 };
-use log::{info, LevelFilter};
+use log::{info, warn, LevelFilter};
+use once_cell::sync::OnceCell;
+use sci_bevy_comm::SciBeevyClient;
+use tokio::runtime::Runtime;
 
 fn main() -> Result<(), Box<dyn Error>> {
     env_logger::builder()
@@ -28,23 +30,29 @@ fn main() -> Result<(), Box<dyn Error>> {
     faer::set_global_parallelism(faer::Par::Rayon(NonZeroUsize::new(16).unwrap()));
 
     let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        //.join("examples")
         .join("data")
         .join("anisotropy")
         .join("2d")
-        .join("constant");
+        //.join("constant");
+        //.join("fan");
+        //.join("radial");
+        .join("spiral");
 
     let dataset_name = "h4_p1";
+
+    let system = load_mfem_linear_system(&data_dir, dataset_name, true)?;
+    initialize_visualization(dataset_name, &system)?;
 
     let MfemLinearSystem {
         matrix,
         rhs,
         coords,
         boundary_indices,
-    } = load_mfem_linear_system(&data_dir, dataset_name, true)?;
+        ..
+    } = system;
 
     let near_null_dim = 256;
-    let smoothing_iters = 50;
+    let smoothing_iters = 200;
     let near_null_space = smooth_vector(&matrix, smoothing_iters, near_null_dim);
 
     info!(
@@ -647,6 +655,100 @@ where
     Ok(())
 }
 
+struct VisualizationContext {
+    runtime: Runtime,
+    client: SciBeevyClient,
+    mesh_vertex_count: usize,
+    solution_to_mesh: Vec<usize>,
+    dataset: String,
+    active: bool,
+}
+
+static VIZ_CONTEXT: OnceCell<Mutex<Option<VisualizationContext>>> = OnceCell::new();
+
+fn initialize_visualization(
+    dataset_name: &str,
+    system: &MfemLinearSystem,
+) -> Result<(), Box<dyn Error>> {
+    let context = VIZ_CONTEXT.get_or_init(|| Mutex::new(None));
+    let mut guard = context
+        .lock()
+        .expect("visualization context mutex poisoned");
+
+    if guard.is_some() {
+        return Ok(());
+    }
+
+    let Some(mesh_geometry) = system.mesh_geometry.clone() else {
+        info!(
+            "No mesh geometry found for dataset {}; smoothing visualization disabled.",
+            dataset_name
+        );
+        return Ok(());
+    };
+
+    if mesh_geometry.vertices.is_empty() {
+        warn!(
+            "Mesh geometry for dataset {} has no vertices; smoothing visualization disabled.",
+            dataset_name
+        );
+        return Ok(());
+    }
+
+    let mesh_vertex_count = mesh_geometry.vertices.len();
+    if mesh_vertex_count != system.original_dimension {
+        warn!(
+            "Mesh vertex count ({}) does not match system dimension ({}) for dataset {}.",
+            mesh_vertex_count, system.original_dimension, dataset_name
+        );
+    }
+
+    let runtime = Runtime::new()?;
+    let client = SciBeevyClient::connect_local();
+
+    let healthy = match runtime.block_on(client.health_check()) {
+        Ok(result) => result,
+        Err(err) => {
+            warn!(
+                "Failed to reach visualization server health endpoint: {err:?}; smoothing visualization disabled."
+            );
+            false
+        }
+    };
+
+    if !healthy {
+        info!(
+            "Visualization server not reachable; smoothing visualization disabled for dataset {}.",
+            dataset_name
+        );
+        return Ok(());
+    }
+
+    if let Err(err) = runtime.block_on(client.upload_mesh(mesh_geometry.clone())) {
+        warn!(
+            "Failed to upload mesh for dataset {} to visualization server: {err:?}; smoothing visualization disabled.",
+            dataset_name
+        );
+        return Ok(());
+    }
+
+    info!(
+        "Uploaded mesh for dataset {} ({} vertices); smoothing visualization enabled.",
+        dataset_name, mesh_vertex_count
+    );
+
+    *guard = Some(VisualizationContext {
+        runtime,
+        client,
+        mesh_vertex_count,
+        solution_to_mesh: system.index_mapping.solution_to_mesh.clone(),
+        dataset: dataset_name.to_string(),
+        active: true,
+    });
+
+    Ok(())
+}
+
 fn smooth_vector(
     mat: &faer::sparse::SparseRowMat<usize, f64>,
     iterations: usize,
@@ -668,15 +770,15 @@ fn smooth_vector(
     .rand::<Mat<f64>>(rng);
     let mut r;
 
-    let mut to_visualize;
-
     for iter in 0..=iterations {
         x = x.qr().compute_thin_Q();
-        to_visualize = x.col(0);
 
-        if iter % 10 == 0 {
+        if iter % 5 == 0 {
+            let to_visualize = x.col(0);
             // Send to vizualization server
-            std::thread::sleep(Duration::from_millis(100));
+            visualize(to_visualize);
+            // and sleep for now to not overload
+            //std::thread::sleep(Duration::from_millis(100));
         }
 
         if iter == iterations {
@@ -700,4 +802,57 @@ fn smooth_vector(
     );
 
     x
+}
+
+fn visualize(vec: ColRef<f64>) {
+    let Some(context) = VIZ_CONTEXT.get() else {
+        return;
+    };
+
+    let mut guard = context
+        .lock()
+        .expect("visualization context mutex poisoned");
+
+    let Some(ctx) = guard.as_mut() else {
+        return;
+    };
+
+    if !ctx.active || ctx.mesh_vertex_count == 0 {
+        return;
+    }
+
+    if ctx.solution_to_mesh.len() != vec.nrows() {
+        warn!(
+            "Solution to mesh mapping length ({}) does not match vector size ({}) for dataset {}; disabling visualization updates.",
+            ctx.solution_to_mesh.len(),
+            vec.nrows(),
+            ctx.dataset
+        );
+        ctx.active = false;
+        return;
+    }
+
+    let mut values = vec![0.0f32; ctx.mesh_vertex_count];
+    for (solution_idx, value) in vec.iter().copied().enumerate() {
+        let mesh_idx = ctx.solution_to_mesh[solution_idx];
+        let Some(slot) = values.get_mut(mesh_idx) else {
+            warn!(
+                "Mesh index {} out of bounds ({} vertices) for dataset {}; disabling visualization updates.",
+                mesh_idx,
+                ctx.mesh_vertex_count,
+                ctx.dataset
+            );
+            ctx.active = false;
+            return;
+        };
+        *slot = value as f32;
+    }
+
+    if let Err(err) = ctx.runtime.block_on(ctx.client.update_function(values)) {
+        warn!(
+            "Failed to send smoothing update to visualization server for dataset {}: {err:?}. Disabling further updates.",
+            ctx.dataset
+        );
+        ctx.active = false;
+    }
 }
