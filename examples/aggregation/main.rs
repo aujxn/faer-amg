@@ -1,7 +1,10 @@
+use faer::Col;
 use faer::{sparse::SparseRowMat, stats::prelude::*, Mat};
 use indicatif::ProgressBar;
+use plotters::style::text_anchor::{HPos, Pos, VPos};
 use plotters::{data::Quartiles as PlottersQuartiles, drawing::DrawingAreaErrorKind, prelude::*};
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 use std::{
     error::Error,
     num::NonZeroUsize,
@@ -29,9 +32,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         .join("data")
         .join("anisotropy")
         .join("2d")
-        .join("spiral");
+        .join("constant");
 
-    let dataset_name = "h5_p1";
+    let dataset_name = "h4_p1";
 
     let MfemLinearSystem {
         matrix,
@@ -58,8 +61,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let matrix = Arc::new(matrix);
 
     let agg_penalty = 0.0005;
-    let coarsening_factor = 64.0;
-    let max_improvement_iters = 100;
+    let coarsening_factor = 32.0;
+    let max_improvement_iters = 1000;
     let partition_builder = PartitionBuilder::new(
         matrix.clone(),
         near_null_space,
@@ -83,9 +86,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let image_dir = manifest_dir.join("target");
     std::fs::create_dir_all(&image_dir)?;
 
-    const GIF_FRAME_DELAY_MS: u32 = 250;
+    const MAX_GIF_FRAMES: usize = 10;
+    const ANIMATION_DURATION: usize = 10;
+    const GIF_FRAME_DELAY_MS: u32 = (ANIMATION_DURATION * 1000 / MAX_GIF_FRAMES) as u32;
     const GIF_FINAL_HOLD_REPEATS: usize = 5000 / GIF_FRAME_DELAY_MS as usize; // Additional repeats for ~5s hold on last frame
-    const MAX_GIF_FRAMES: usize = 60;
 
     let gif_path = image_dir.join("aggregation_boundary.gif");
     let gif_backend =
@@ -664,8 +668,21 @@ fn smooth_vector(
     .rand::<Mat<f64>>(rng);
     let mut r;
 
-    for _ in 0..iterations {
+    let mut to_visualize;
+
+    for iter in 0..=iterations {
         x = x.qr().compute_thin_Q();
+        to_visualize = x.col(0);
+
+        if iter % 10 == 0 {
+            // Send to vizualization server
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        if iter == iterations {
+            break;
+        }
+
         r = mat.as_ref() * &x;
         r = &l1_diag * r;
         x -= r;
@@ -682,5 +699,5 @@ fn smooth_vector(
         iterations, convergence_factors
     );
 
-    x.qr().compute_thin_Q()
+    x
 }
