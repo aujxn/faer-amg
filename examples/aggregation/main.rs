@@ -1,9 +1,8 @@
-use faer::{sparse::SparseRowMat, stats::prelude::*, Col, ColRef, Mat};
+use clap::{Parser, ValueEnum};
+use faer::{sparse::SparseRowMat, stats::prelude::*, ColRef, Mat};
 use indicatif::ProgressBar;
-use plotters::style::text_anchor::{HPos, Pos, VPos};
 use plotters::{data::Quartiles as PlottersQuartiles, drawing::DrawingAreaErrorKind, prelude::*};
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
 use std::{
     error::Error,
     num::NonZeroUsize,
@@ -21,7 +20,62 @@ use once_cell::sync::OnceCell;
 use sci_bevy_comm::SciBeevyClient;
 use tokio::runtime::Runtime;
 
+#[derive(Parser)]
+#[command(name = "aggregation")]
+#[command(about = "Algebraic multigrid aggregation example")]
+struct Cli {
+    /// Coefficient type: constant, fan, spiral, or radial
+    #[arg(long, value_enum, default_value_t = CoefType::Spiral)]
+    coef: CoefType,
+
+    /// Number of refinements (the number after 'h' in 'h4p1')
+    #[arg(long, default_value_t = 4)]
+    refinements: u32,
+
+    /// Near null space dimension
+    #[arg(long, default_value_t = 256)]
+    near_null_dim: usize,
+
+    /// Number of smoothing iterations
+    #[arg(long, default_value_t = 200)]
+    smoothing_iters: usize,
+
+    /// Coarsening factor
+    #[arg(long, short = 'c', alias = "cf", default_value_t = 32.0)]
+    coarsening_factor: f64,
+
+    /// Maximum improvement iterations
+    #[arg(long, default_value_t = 1000)]
+    improvement_iters: usize,
+
+    /// Maximum number of GIF frames to generate
+    #[arg(long, default_value_t = 10)]
+    gif_frames: usize,
+
+    /// GIF animation length in seconds
+    #[arg(long, default_value_t = 10)]
+    gif_len: usize,
+
+    /// Output file for GIF animation
+    #[arg(long, default_value = "aggregation_boundary.gif")]
+    out_file: String,
+
+    /// Skip the smoothing visualization
+    #[arg(long)]
+    no_viz: bool,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+enum CoefType {
+    Constant,
+    Fan,
+    Spiral,
+    Radial,
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
+    let cli = Cli::parse();
+
     env_logger::builder()
         .format_timestamp(None)
         .filter_level(LevelFilter::Info)
@@ -29,19 +83,25 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     faer::set_global_parallelism(faer::Par::Rayon(NonZeroUsize::new(16).unwrap()));
 
+    let coef_dir = match cli.coef {
+        CoefType::Constant => "constant",
+        CoefType::Fan => "fan",
+        CoefType::Spiral => "spiral",
+        CoefType::Radial => "radial",
+    };
+
     let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("data")
         .join("anisotropy")
         .join("2d")
-        //.join("constant");
-        //.join("fan");
-        //.join("radial");
-        .join("spiral");
+        .join(coef_dir);
 
-    let dataset_name = "h4_p1";
+    let dataset_name = format!("h{}_p1", cli.refinements);
 
-    let system = load_mfem_linear_system(&data_dir, dataset_name, true)?;
-    initialize_visualization(dataset_name, &system)?;
+    let system = load_mfem_linear_system(&data_dir, &dataset_name, true)?;
+    if !cli.no_viz {
+        initialize_visualization(&dataset_name, &system)?;
+    }
 
     let MfemLinearSystem {
         matrix,
@@ -51,9 +111,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         ..
     } = system;
 
-    let near_null_dim = 256;
-    let smoothing_iters = 200;
-    let near_null_space = smooth_vector(&matrix, smoothing_iters, near_null_dim);
+    let near_null_space = smooth_vector(&matrix, cli.smoothing_iters, cli.near_null_dim, cli.no_viz);
 
     info!(
         "Loaded system from {}\n  matrix: {} x {} ({} nnz)\n  rhs columns: {}\n  geom dim: {}\n  removed dirichlet nodes: {}",
@@ -69,14 +127,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let matrix = Arc::new(matrix);
 
     let agg_penalty = 0.0005;
-    let coarsening_factor = 32.0;
-    let max_improvement_iters = 1000;
     let partition_builder = PartitionBuilder::new(
         matrix.clone(),
         near_null_space,
-        coarsening_factor,
+        cli.coarsening_factor,
         agg_penalty,
-        max_improvement_iters,
+        cli.improvement_iters,
     );
 
     let mut partitioner = partition_builder.create_partitioner();
@@ -94,14 +150,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let image_dir = manifest_dir.join("target");
     std::fs::create_dir_all(&image_dir)?;
 
-    const MAX_GIF_FRAMES: usize = 10;
-    const ANIMATION_DURATION: usize = 10;
-    const GIF_FRAME_DELAY_MS: u32 = (ANIMATION_DURATION * 1000 / MAX_GIF_FRAMES) as u32;
-    const GIF_FINAL_HOLD_REPEATS: usize = 5000 / GIF_FRAME_DELAY_MS as usize; // Additional repeats for ~5s hold on last frame
+    let gif_frame_delay_ms: u32 = (cli.gif_len * 1000 / cli.gif_frames) as u32;
+    let gif_final_hold_repeats: usize = 5000 / gif_frame_delay_ms as usize; // Additional repeats for ~5s hold on last frame
 
-    let gif_path = image_dir.join("aggregation_boundary.gif");
+    let gif_path = image_dir.join(&cli.out_file);
     let gif_backend =
-        BitMapBackend::gif(&gif_path, (FRAME_WIDTH, FRAME_HEIGHT), GIF_FRAME_DELAY_MS)
+        BitMapBackend::gif(&gif_path, (FRAME_WIDTH, FRAME_HEIGHT), gif_frame_delay_ms)
             .map_err(|err| Box::<dyn Error>::from(err))?;
     let gif_area = gif_backend.into_drawing_area();
 
@@ -126,7 +180,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     last_geometry = geometry.clone();
 
-    let frames_to_generate = MAX_GIF_FRAMES.min(max_improvement_iters.saturating_add(1));
+    let frames_to_generate = cli.gif_frames.min(cli.improvement_iters.saturating_add(1));
     let iterations_to_run = frames_to_generate.saturating_sub(1);
 
     for iter in 0..iterations_to_run {
@@ -153,7 +207,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         last_geometry = geometry.clone();
     }
 
-    for _ in 0..GIF_FINAL_HOLD_REPEATS {
+    for _ in 0..gif_final_hold_repeats {
         gif_area
             .present()
             .map_err(|err| Box::<dyn Error>::from(err))?;
@@ -753,6 +807,7 @@ fn smooth_vector(
     mat: &faer::sparse::SparseRowMat<usize, f64>,
     iterations: usize,
     near_null_dim: usize,
+    no_viz: bool,
 ) -> Mat<f64> {
     let mat_ref = mat.as_ref();
     let l1_diag = new_l1(&mat_ref);
@@ -773,12 +828,9 @@ fn smooth_vector(
     for iter in 0..=iterations {
         x = x.qr().compute_thin_Q();
 
-        if iter % 5 == 0 {
+        if iter % 5 == 0 && !no_viz {
             let to_visualize = x.col(0);
-            // Send to vizualization server
             visualize(to_visualize);
-            // and sleep for now to not overload
-            //std::thread::sleep(Duration::from_millis(100));
         }
 
         if iter == iterations {
