@@ -36,6 +36,10 @@ impl Partition {
         &self.node_to_agg
     }
 
+    pub fn aggregates(&self) -> &Vec<BTreeSet<usize>> {
+        &self.agg_to_node
+    }
+
     pub fn info(&self) {
         let mut max_agg = usize::MIN;
         let mut min_agg = usize::MAX;

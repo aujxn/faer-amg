@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, usize};
 
 use faer::{col::AsColRef, linalg::matmul::dot::inner_prod, sparse::SparseRowMat, Col};
 use rayon::{
@@ -11,11 +11,6 @@ use rayon::{
 use super::{AdjacencyList, Partition};
 use log::{info, trace, warn};
 
-enum AggSize {
-    TooBig,
-    TooSmall,
-}
-
 pub struct ModularityPartitioner {
     pub(crate) base_strength: AdjacencyList,
     strength: AdjacencyList,
@@ -25,6 +20,7 @@ pub struct ModularityPartitioner {
     pub coarsening_factor: f64,
     pub agg_size_penalty: f64,
     pub partition: Partition,
+    pub agg_sizes: Vec<usize>,
 }
 
 impl ModularityPartitioner {
@@ -93,6 +89,7 @@ impl ModularityPartitioner {
             coarsening_factor,
             agg_size_penalty,
             partition: Partition::singleton(mat.clone()),
+            agg_sizes: vec![1; mat.nrows()],
         }
     }
 
@@ -107,19 +104,37 @@ impl ModularityPartitioner {
             self.partition.pairwise_merge(&pairs, &unmatched);
             self.pairwise_merge_rowsums(&pairs, &unmatched);
         }
+        self.agg_sizes = self.partition.agg_to_node.iter().map(|agg| agg.len()).collect();
+    }
+
+    pub fn update_agg_sizes(&mut self) {
+
+        self.agg_sizes = vec![0; self.partition.aggregates().len()];
+        for (_, agg_id) in self.partition.node_to_agg.iter().copied().enumerate() {
+            self.agg_sizes[agg_id] += 1;
+        }
+        /*
+        self.agg_sizes = self
+            .partition
+            .aggregates()
+            .iter()
+            .map(|agg| agg.len())
+            .collect();
+        */
     }
 
     pub fn modularity(&self) -> f64 {
         self.partition
-            .agg_to_node
+            .node_to_agg
             .par_iter()
-            .map(|agg| {
+            .copied()
+            .enumerate()
+            .map(|(node_i, agg_i)| {
                 let mut agg_sum = 0.0;
-                for i in agg.iter().copied() {
-                    for j in agg.iter().copied() {
-                        // NOTE: could optimize on assumption of symmetry and no diagonal
-                        agg_sum += self.base_strength.get(i, j)
-                            - self.base_row_sums[i] * self.base_row_sums[j] * self.inverse_total;
+                for (node_j, a_ij) in self.base_strength.nodes[node_i].iter().copied() {
+                    let agg_j =  self.partition.node_to_agg[node_j];
+                    if agg_i == agg_j {
+                        agg_sum += a_ij - self.base_row_sums[node_i] * self.base_row_sums[node_j] * self.inverse_total;
                     }
                 }
                 agg_sum
@@ -129,21 +144,24 @@ impl ModularityPartitioner {
     }
 
     pub fn total_agg_size_cost(&self) -> f64 {
-        (0..self.partition.agg_to_node.len())
-            .into_par_iter()
-            .map(|agg_id| self.agg_size_cost(agg_id).0)
+        self.agg_sizes
+            .par_iter()
+            .copied()
+            .map(|agg_size| {
+                let diff = self.coarsening_factor - agg_size as f64;
+                diff.powf(2.0) * self.agg_size_penalty
+            })
             .sum::<f64>()
     }
 
-    fn agg_size_cost(&self, agg_id: usize) -> (f64, AggSize) {
-        let agg_size = self.partition.agg_to_node[agg_id].len() as f64;
-        let diff = self.coarsening_factor - agg_size;
-        let cost = diff.powf(2.0) * self.agg_size_penalty;
-        //let cost = diff.abs() * self.agg_size_penalty;
-        if agg_size > self.coarsening_factor {
-            (cost, AggSize::TooBig)
+    fn move_size_penalty(&self, src_node: usize, dst_node: usize) -> f64 {
+        let src_agg = self.partition.node_to_agg[src_node];
+        let dst_agg = self.partition.node_to_agg[dst_node];
+        let delta: f64 = self.agg_sizes[src_agg] as f64 - self.agg_sizes[dst_agg] as f64;
+        if delta > 0.0 {
+            delta.powf(2.0) * self.agg_size_penalty
         } else {
-            (cost, AggSize::TooSmall)
+            -delta.powf(2.0) * self.agg_size_penalty
         }
     }
 
@@ -241,6 +259,10 @@ impl ModularityPartitioner {
     }
 
     pub fn improve(&mut self, max_iter: usize) {
+        /* Pairwise merge results in valid partition object so don't need this unless
+        * that algorithm is simplified
+        }
+        */
         let strength = &self.base_strength;
         let row_sums = &self.base_row_sums;
         let inverse_total = self.inverse_total;
@@ -254,50 +276,35 @@ impl ModularityPartitioner {
                 .copied()
                 .enumerate()
                 .filter_map(|(node_i, agg_id)| {
+                    if self.agg_sizes[agg_id] == 1 {
+                        // If we are only member of aggregate we can't leave, we want number of aggs
+                        // to stay the same... There are probably better approaches than this.
+                        return None;
+                    }
                     let mut out_deg: HashMap<usize, f64> = HashMap::new();
-                    let agg = &self.partition.agg_to_node[agg_id];
                     let neighborhood = &strength.nodes[node_i];
 
-                    let (cost, size) = self.agg_size_cost(agg_id);
-                    let in_size_obj = match size {
-                        AggSize::TooBig => -cost,
-                        AggSize::TooSmall => cost
-                    };
-                    let in_deg: f64 = agg
+                    let mut in_deg: f64 = 0.0;
+
+                    for (node_j, a_ij) in neighborhood
                         .iter()
-                        .copied()
-                        .map(|node_j| {
-                            let a_ij = strength.get(node_i, node_j);
-                            a_ij - row_sums[node_i] * row_sums[node_j] * inverse_total
-                        })
-                        .sum::<f64>()
-                        + in_size_obj;
-
-                    for node_j in neighborhood.iter().map(|(j, _)| *j) {
-                        if !agg.contains(&node_j) {
+                        .copied() 
+                    {
+                        assert_ne!(node_i, node_j, "Diagonal entries in strength matrix...");
+                        if self.partition.node_assignments()[node_j] == agg_id {
+                            in_deg += a_ij - row_sums[node_i] * row_sums[node_j] * inverse_total;
+                        } else {
                             let agg_j = self.partition.node_to_agg[node_j];
-                            assert_ne!(
-                                agg_j, agg_id,
-                                "Node {} from agg {} is connected to node {} from agg {}.",
-                                node_i, agg_id, node_j, agg_j
-                            );
-                            if out_deg.get(&agg_j).is_none() {
 
-                                let (cost, size) = self.agg_size_cost(agg_j);
-                                let out_size_obj = match size {
-                                    AggSize::TooBig => -cost,
-                                    AggSize::TooSmall => cost
-                                };
-                                let deg: f64 = self.partition.agg_to_node[agg_j]
-                                    .iter()
-                                    .copied()
-                                    .map(|node_j| {
-                                        let a_ij = strength.get(node_i, node_j);
-                                        a_ij - row_sums[node_i] * row_sums[node_j] * inverse_total
-                                    })
-                                    .sum::<f64>()
-                                    + out_size_obj;
-                                out_deg.insert(agg_j, deg);
+                            match out_deg.get_mut(&agg_j) {
+                                None => {
+                                    let size_penalty = self.move_size_penalty(node_i, node_j);
+                                    let deg = size_penalty + a_ij - row_sums[node_i] * row_sums[node_j] * inverse_total;
+                                    out_deg.insert(agg_j, deg);
+                                },
+                                Some(out_deg) => {
+                                    *out_deg += a_ij - row_sums[node_i] * row_sums[node_j] * inverse_total;
+                                }
                             }
                         }
                     }
@@ -311,10 +318,18 @@ impl ModularityPartitioner {
                         .map(|(new_agg, deg)| (new_agg, deg));
 
                     match max_out {
-                        Some((new_agg, max_deg)) => trace!("node {} is part of agg {} with {} nodes and {:.2} in-degree and {:.2} max out-degree to join agg {} with {} nodes", node_i, agg_id, agg.len(), in_deg, max_deg, new_agg, self.partition.node_assignments()[new_agg]),
-                        None =>trace!("node {} is part of agg {} with {} nodes and {:.2} in-degree and no options to leave!", node_i, agg_id, agg.len(), in_deg),
+                        Some((new_agg, max_deg)) => {
+                            trace!("node {} is part of agg {} with {} nodes and {:.2} in-degree and {:.2} max out-degree to join agg {} with {} nodes", node_i, agg_id, self.agg_sizes[agg_id], in_deg, max_deg, new_agg, self.agg_sizes[new_agg]);
+
+                            if max_deg > in_deg {
+                                Some((node_i, new_agg, max_deg - in_deg))
+                            } else { None }
+                        },
+                        None => {
+                                trace!("node {} is part of agg {} with {} nodes and {:.2} in-degree and no options to leave!", node_i, agg_id, self.agg_sizes[node_i], in_deg);
+                            None
+                        },
                     }
-                    max_out.map(|(new_agg, max_deg)| (node_i, new_agg, max_deg - in_deg))
                 })
                 .collect();
 
@@ -333,12 +348,15 @@ impl ModularityPartitioner {
                     //if alive_nodes[node_id] {
                     assert_ne!(new_agg, old_agg);
                     self.partition.node_to_agg[node_id] = new_agg;
-                    let result = self.partition.agg_to_node[old_agg].remove(&node_id);
-                    assert!(result);
-                    self.partition.agg_to_node[new_agg].insert(node_id);
+                    self.agg_sizes[old_agg] -= 1;
+                    self.agg_sizes[new_agg] += 1;
+                    //let result = self.partition.agg_to_node[old_agg].remove(&node_id);
+                    //assert!(result);
+                    //self.partition.agg_to_node[new_agg].insert(node_id);
                     true_swaps += 1;
 
                     alive_aggs[new_agg] = false;
+                    alive_aggs[old_agg] = false;
                     alive_nodes[node_id] = false;
                     for (neighbor, _) in strength.nodes[node_id].iter().copied() {
                         alive_nodes[neighbor] = false;
@@ -346,17 +364,7 @@ impl ModularityPartitioner {
                     }
                 }
             }
-            let old_agg_count = self.partition.agg_to_node.len();
-            self.partition.agg_to_node.retain(|agg| !agg.is_empty());
-            let new_agg_count = self.partition.agg_to_node.len();
 
-            if old_agg_count > new_agg_count {
-                for (agg_id, agg) in self.partition.agg_to_node.iter().enumerate() {
-                    for node_id in agg.iter().copied() {
-                        self.partition.node_to_agg[node_id] = agg_id;
-                    }
-                }
-            }
             if pass % dbg_iters == 0 {
                 info!(
                     "Pass {}:\n\t{} swaps\n\t{:.4} modularity\n\t{:.4} size penalty",
@@ -365,7 +373,25 @@ impl ModularityPartitioner {
                     self.modularity(),
                     self.total_agg_size_cost()
                 );
-                self.partition.info();
+                //self.partition.info();
+                let n_aggs = self.agg_sizes.len();
+                let mut min_agg = usize::MAX;
+                let mut max_agg = 0;
+                for agg_size in self.agg_sizes.iter().copied() {
+                    if agg_size < min_agg {
+                        min_agg = agg_size;
+                    }
+                    if agg_size > max_agg {
+                        max_agg = agg_size;
+                    }
+                }
+                info!(
+                    "Partition has {} aggs ({:.2} avg size) with min size of {} and max size of {}",
+                    n_aggs,
+                    self.base_strength.nodes.len() as f64 / n_aggs as f64,
+                    min_agg,
+                    max_agg
+                );
             }
             #[cfg(debug_assertions)]
             self.partition.validate();
