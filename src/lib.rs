@@ -1,3 +1,4 @@
+pub mod adaptivity;
 pub mod decompositions;
 pub mod interpolation;
 pub mod partitioners;

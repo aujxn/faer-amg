@@ -160,6 +160,9 @@ impl BiLinOp<f64> for StationaryIteration {
     }
 }
 
+impl Precond<f64> for StationaryIteration {}
+impl BiPrecond<f64> for StationaryIteration {}
+
 /// Cholesky solver abstraction that implements linear operator interface.
 #[derive(Clone, Debug)]
 pub struct CholeskySolve {

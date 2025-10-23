@@ -554,7 +554,7 @@ impl ModularityPartitioner {
             if let Some(callback) = self.callback.as_ref() {
                 callback(pass, &self);
             }
-            info!("swaps: {true_swaps}");
+            //info!("swaps: {true_swaps}");
         }
     }
 

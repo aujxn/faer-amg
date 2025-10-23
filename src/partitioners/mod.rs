@@ -251,7 +251,7 @@ impl AdjacencyList {
             }
         }
 
-        let min_strength = 1e-4;
+        let min_strength = 1e-3;
 
         nodes.par_iter_mut().for_each(|neighborhood| {
             for (_, strength) in neighborhood.iter_mut() {
