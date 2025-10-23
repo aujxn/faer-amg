@@ -1,19 +1,23 @@
+use std::sync::Arc;
+
 use faer::{
     diag::Diag,
     dyn_stack::{MemStack, StackReq},
     linalg::solvers::SolveCore,
+    mat::{AsMatMut, AsMatRef},
     matrix_free::{BiLinOp, BiPrecond, LinOp, Precond},
+    prelude::{Reborrow, ReborrowMut},
     sparse::{
         linalg::solvers::{Llt, SymbolicLlt},
         SparseRowMatRef,
     },
-    MatMut, MatRef, Par,
+    Mat, MatMut, MatRef, Par,
 };
 
 pub type L2 = Diag<f64>;
 pub type L1 = Diag<f64>;
 
-pub fn new_l2(mat: &SparseRowMatRef<usize, f64>) -> L2 {
+pub fn new_l2(mat: SparseRowMatRef<usize, f64>) -> L2 {
     let nrows = mat.nrows();
     let diag_sqrt: Vec<f64> = (0..nrows)
         .map(|i| mat.get(i, i).map(|v| v.sqrt()).unwrap())
@@ -33,7 +37,7 @@ pub fn new_l2(mat: &SparseRowMatRef<usize, f64>) -> L2 {
     l2_inverse
 }
 
-pub fn new_l1(mat: &SparseRowMatRef<usize, f64>) -> L1 {
+pub fn new_l1(mat: SparseRowMatRef<usize, f64>) -> L1 {
     let nrows = mat.nrows();
     let mut l1_inverse: L1 = Diag::zeros(nrows);
 
@@ -56,6 +60,104 @@ pub fn new_jacobi(mat: &SparseRowMatRef<usize, f64>, omega: f64) -> L1 {
         *val = omega / *mat.get(i, i).unwrap();
     }
     jacobi
+}
+
+#[derive(Clone, Debug)]
+pub struct StationaryIteration {
+    mat: Arc<dyn LinOp<f64> + Send>,
+    prec: Arc<dyn LinOp<f64> + Send>,
+    iters: usize,
+}
+
+impl StationaryIteration {
+    pub fn new(
+        mat: Arc<dyn LinOp<f64> + Send>,
+        prec: Arc<dyn LinOp<f64> + Send>,
+        iters: usize,
+    ) -> Self {
+        Self { mat, prec, iters }
+    }
+}
+
+impl LinOp<f64> for StationaryIteration {
+    // TODO: low level API
+    fn apply_scratch(&self, rhs_ncols: usize, par: Par) -> StackReq {
+        let _rhs_ncols = rhs_ncols;
+        let _par = par;
+        StackReq::EMPTY
+    }
+
+    fn nrows(&self) -> usize {
+        self.mat.nrows()
+    }
+
+    fn ncols(&self) -> usize {
+        self.mat.ncols()
+    }
+
+    fn apply(&self, out: MatMut<'_, f64>, rhs: MatRef<'_, f64>, par: Par, stack: &mut MemStack) {
+        let mut out = out;
+        let mut work1 = Mat::zeros(out.nrows(), out.ncols());
+        let mut work2 = Mat::zeros(out.nrows(), out.ncols());
+        work1.copy_from(rhs);
+        for _ in 0..self.iters {
+            self.mat
+                .apply(work2.rb_mut(), work1.as_mat_ref(), par, stack);
+            self.prec
+                .apply(out.rb_mut(), work2.as_mat_ref(), par, stack);
+            work1 -= out.rb();
+        }
+        out.copy_from(work1);
+    }
+
+    fn conj_apply(
+        &self,
+        out: MatMut<'_, f64>,
+        rhs: MatRef<'_, f64>,
+        par: Par,
+        stack: &mut MemStack,
+    ) {
+        // TODO: only real for now
+        self.apply(out, rhs, par, stack);
+    }
+}
+
+impl BiLinOp<f64> for StationaryIteration {
+    fn transpose_apply_scratch(&self, rhs_ncols: usize, par: Par) -> StackReq {
+        // TODO : only symmetric multigrid
+        self.apply_scratch(rhs_ncols, par)
+    }
+
+    fn transpose_apply(
+        &self,
+        out: MatMut<'_, f64>,
+        rhs: MatRef<'_, f64>,
+        par: Par,
+        stack: &mut MemStack,
+    ) {
+        let mut out = out;
+        let mut work1 = Mat::zeros(out.nrows(), out.ncols());
+        let mut work2 = Mat::zeros(out.nrows(), out.ncols());
+        work1.copy_from(rhs);
+        for _ in 0..self.iters {
+            self.prec
+                .apply(work2.rb_mut(), work1.as_mat_ref(), par, stack);
+            self.mat.apply(out.rb_mut(), work2.as_mat_ref(), par, stack);
+            work1 -= out.rb();
+        }
+        out.copy_from(work1);
+    }
+
+    fn adjoint_apply(
+        &self,
+        out: MatMut<'_, f64>,
+        rhs: MatRef<'_, f64>,
+        par: Par,
+        stack: &mut MemStack,
+    ) {
+        // only real
+        self.transpose_apply(out, rhs, par, stack);
+    }
 }
 
 /// Cholesky solver abstraction that implements linear operator interface.

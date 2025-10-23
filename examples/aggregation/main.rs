@@ -4,29 +4,44 @@ use indicatif::ProgressBar;
 use std::{
     error::Error,
     num::NonZeroUsize,
+    ops::DerefMut,
     path::PathBuf,
+    rc::Rc,
     sync::{Arc, Mutex},
     thread,
     time::Duration,
 };
 
 use faer_amg::{
-    partitioners::PartitionBuilder,
-    preconditioners::smoothers::new_l1,
+    decompositions::rand_svd::rand_svd,
+    interpolation::smoothed_aggregation,
+    partitioners::{
+        multilevel::{self, MultilevelPartitionerConfig},
+        ModularityPartitioner, Partition, PartitionBuilder,
+    },
+    preconditioners::smoothers::{new_l1, StationaryIteration},
     utils::{load_mfem_linear_system, MfemLinearSystem},
 };
-use log::{info, warn, LevelFilter};
+use log::{error, info, warn, LevelFilter};
 use once_cell::sync::OnceCell;
-use sci_bevy_comm::SciBeevyClient;
+use sci_bevy_comm::{PartitionMetrics, SciBeevyClient};
 use tokio::runtime::Runtime;
 
 #[derive(Parser)]
 #[command(name = "aggregation")]
 #[command(about = "Algebraic multigrid aggregation example")]
 struct Cli {
-    /// Coefficient type: constant, fan, spiral, or radial
+    /// Coefficient type: constant, block_random, circles, radial, sine_tangent, or spiral
     #[arg(long, value_enum, default_value_t = CoefType::Spiral)]
     coef: CoefType,
+
+    /// Use the blend_x variant of the coefficient data
+    #[arg(long = "blend_x")]
+    blend_x: bool,
+
+    /// Apply coarsening algorithm recursively
+    #[arg(long = "multilevel")]
+    multilevel: bool,
 
     /// Number of refinements (the number after 'h' in 'h4p1')
     #[arg(long, default_value_t = 4)]
@@ -56,53 +71,64 @@ struct Cli {
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
 enum CoefType {
     Constant,
-    Fan,
-    Spiral,
+    #[value(alias = "block_random")]
+    BlockRandom,
+    Circles,
     Radial,
+    #[value(alias = "sine_tangent")]
+    SineTangent,
+    Spiral,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let cli = Cli::parse();
+    {
+        let cli = Cli::parse();
+        let no_viz = cli.no_viz;
 
-    env_logger::builder()
-        .format_timestamp(None)
-        .filter_level(LevelFilter::Info)
-        .try_init()?;
+        env_logger::builder()
+            .format_timestamp(None)
+            .filter_level(LevelFilter::Info)
+            .try_init()?;
 
-    faer::set_global_parallelism(faer::Par::Rayon(NonZeroUsize::new(16).unwrap()));
+        faer::set_global_parallelism(faer::Par::Rayon(NonZeroUsize::new(16).unwrap()));
 
-    let coef_dir = match cli.coef {
-        CoefType::Constant => "constant",
-        CoefType::Fan => "fan",
-        CoefType::Spiral => "spiral",
-        CoefType::Radial => "radial",
-    };
+        let base_coef_dir = match cli.coef {
+            CoefType::Constant => "constant",
+            CoefType::BlockRandom => "block_random",
+            CoefType::Circles => "circles",
+            CoefType::Radial => "radial",
+            CoefType::SineTangent => "sine_tangent",
+            CoefType::Spiral => "spiral",
+        };
 
-    let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("data")
-        .join("anisotropy")
-        .join("2d")
-        .join(coef_dir);
+        let coef_dir = if cli.blend_x {
+            format!("{base_coef_dir}_blend_x")
+        } else {
+            base_coef_dir.to_owned()
+        };
 
-    let dataset_name = format!("h{}_p1", cli.refinements);
+        let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("data")
+            .join("anisotropy")
+            .join("2d")
+            .join(&coef_dir);
 
-    let system = load_mfem_linear_system(&data_dir, &dataset_name, true)?;
-    if !cli.no_viz {
-        initialize_visualization(&dataset_name, &system)?;
-    }
+        let dataset_name = format!("h{}_p1", cli.refinements);
 
-    let MfemLinearSystem {
-        matrix,
-        rhs,
-        coords,
-        boundary_indices,
-        ..
-    } = system;
+        let system = load_mfem_linear_system(&data_dir, &dataset_name, true)?;
+        if !no_viz {
+            initialize_visualization(&dataset_name, &system)?;
+        }
 
-    let near_null_space =
-        smooth_vector(&matrix, cli.smoothing_iters, cli.near_null_dim, cli.no_viz);
+        let MfemLinearSystem {
+            matrix,
+            rhs,
+            coords,
+            boundary_indices,
+            ..
+        } = system;
 
-    info!(
+        info!(
         "Loaded system from {}\n  matrix: {} x {} ({} nnz)\n  rhs columns: {}\n  geom dim: {}\n  removed dirichlet nodes: {}",
         data_dir.join(dataset_name).display(),
         matrix.nrows(),
@@ -113,59 +139,111 @@ fn main() -> Result<(), Box<dyn Error>> {
         boundary_indices.len()
     );
 
-    let matrix = Arc::new(matrix);
-
-    let agg_penalty = 0.0005;
-    let partition_builder = PartitionBuilder::new(
-        matrix.clone(),
-        near_null_space,
-        cli.coarsening_factor,
-        agg_penalty,
-        cli.improvement_iters,
-    );
-
-    let mut partitioner = partition_builder.create_partitioner();
-    partitioner.partition();
-
-    info!(
-        "Generated aggregation:\n  aggregates: {}\n  fine nodes: {}\n  coarsening factor: {:.2}",
-        partitioner.partition.naggs(),
-        partitioner.partition.nnodes(),
-        partitioner.partition.cf()
-    );
-    partitioner.partition.info();
-
-    if !cli.no_viz {
-        broadcast_partition(&partitioner.partition);
-    }
-
-    let n_updates = 500;
-    let iters_per_update = (cli.improvement_iters / n_updates).max(1);
-    for iter in 0..cli.improvement_iters {
-        partitioner.improve(1);
-        if !cli.no_viz && iter % iters_per_update == 0 {
-            broadcast_partition(&partitioner.partition);
-            //thread::sleep(Duration::from_millis(3000));
-        }
-
-        info!(
-            "Improvement iteration {} -> aggregates: {}, cf: {:.2}, modularity: {:.4}, size cost: {:.4}",
-            iter + 1,
-            partitioner.partition.naggs(),
-            partitioner.partition.cf(),
-            partitioner.modularity(),
-            partitioner.total_agg_size_cost()
+        //let fine_near_null_space = smooth_vector(&matrix, cli.smoothing_iters, cli.near_null_dim, no_viz);
+        let matrix = Arc::new(matrix);
+        let fine_near_null_space = smooth_vector_rand_svd(
+            matrix.clone(),
+            cli.smoothing_iters,
+            cli.near_null_dim,
+            no_viz,
         );
+
+        let base_partition = Partition::singleton(matrix.nrows());
+        let prev_partition = Partition::singleton(matrix.nrows());
+        let level = 1;
+        let safe_state: State = Arc::new(Mutex::new((level, base_partition, prev_partition)));
+
+        let dist_penalty = 1e-6;
+        let size_penalty = 1e-1;
+        if cli.multilevel {
+            let mut partition_builder = MultilevelPartitionerConfig::new(
+                matrix.clone(),
+                fine_near_null_space.as_ref(),
+                cli.coarsening_factor,
+                size_penalty,
+                dist_penalty,
+            );
+            partition_builder.max_improvement_iters = cli.improvement_iters;
+
+            partition_builder.callback = Some(Arc::new(
+                move |iter: usize, partitioner: &ModularityPartitioner| {
+                    callback(iter, partitioner, safe_state.clone())
+                },
+            ));
+            let mut ml_partitioner = partition_builder.build();
+            ml_partitioner.partition();
+        } else {
+            let mut partition_builder = PartitionBuilder::new(
+                matrix.clone(),
+                1,
+                fine_near_null_space.as_ref(),
+                cli.coarsening_factor,
+                size_penalty,
+                dist_penalty,
+                cli.improvement_iters,
+            );
+
+            partition_builder.callback = Some(Arc::new(
+                move |iter: usize, partitioner: &ModularityPartitioner| {
+                    callback(iter, partitioner, safe_state.clone())
+                },
+            ));
+            let _partition = partition_builder.build();
+        }
+    }
+    Ok(())
+}
+
+type State = Arc<Mutex<(usize, Partition, Partition)>>;
+fn callback(iter: usize, partitioner: &ModularityPartitioner, state: State) {
+    let p = partitioner.get_partition();
+    let ((_max_agg, max_size), (_min_agg, min_size)) = partitioner.max_and_min_weighted_aggs();
+
+    let size_cost = partitioner.total_agg_size_cost() as f32;
+    let dist_cost = partitioner.total_dist_cost() as f32;
+    let edge_cost = partitioner.total_edge_cost() as f32;
+
+    let metrics = PartitionMetrics {
+        iter: iter as u32,
+        size_cost,
+        dist_cost,
+        edge_cost,
+    };
+
+    match state.lock() {
+        Ok(mut guard) => {
+            let state = guard.deref_mut();
+            if state.2.nnodes() != p.nnodes() {
+                state.1.compose(&state.2);
+                state.0 += 1;
+                info!("NEW LEVEL: {}", state.0);
+                broadcast_partition(state.1.node_assignments(), metrics);
+            } else {
+                let to_broadcast: Vec<usize> = state
+                    .1
+                    .node_assignments()
+                    .iter()
+                    .map(|old_agg| p.node_assignments()[*old_agg])
+                    .collect();
+                broadcast_partition(&to_broadcast, metrics);
+            }
+            state.2 = p.clone();
+        }
+        Err(err) => error!("{:?}", err),
     }
 
     info!(
-        "Final partition -> aggregates: {}, fine nodes: {}, coarsening factor: {:.2}",
-        partitioner.partition.naggs(),
-        partitioner.partition.nnodes(),
-        partitioner.partition.cf()
+        "Iter: {}\n\tfine nodes: {}\n\taggregates: {}\n\tcoarsening factor: {:.2}\n\tmax / min agg size: {} / {}\n\tsize cost: {:.2e}\n\tdist cost: {:.2e}\n\tedge cost: {:.2e}",
+        iter,
+        p.nnodes(),
+        p.naggs(),
+        p.cf(),
+        max_size,
+        min_size,
+        size_cost,
+        dist_cost,
+        edge_cost,
     );
-
-    Ok(())
 }
 
 struct VisualizationContext {
@@ -179,7 +257,7 @@ struct VisualizationContext {
 
 static VIZ_CONTEXT: OnceCell<Mutex<Option<VisualizationContext>>> = OnceCell::new();
 
-fn broadcast_partition(partition: &faer_amg::partitioners::Partition) {
+fn broadcast_partition(node_assignments: &[usize], metrics: PartitionMetrics) {
     let Some(context) = VIZ_CONTEXT.get() else {
         return;
     };
@@ -196,11 +274,10 @@ fn broadcast_partition(partition: &faer_amg::partitioners::Partition) {
         return;
     }
 
-    let assignments = partition.node_assignments();
-    if ctx.solution_to_mesh.len() != assignments.len() {
+    if ctx.solution_to_mesh.len() != node_assignments.len() {
         warn!(
             "Partition assignment length ({}) does not match mesh mapping ({}) for dataset {}; disabling visualization updates.",
-            assignments.len(),
+            node_assignments.len(),
             ctx.solution_to_mesh.len(),
             ctx.dataset
         );
@@ -209,7 +286,7 @@ fn broadcast_partition(partition: &faer_amg::partitioners::Partition) {
     }
 
     let mut mesh_assignments = vec![0u32; ctx.mesh_vertex_count];
-    for (solution_idx, &agg) in assignments.iter().enumerate() {
+    for (solution_idx, &agg) in node_assignments.iter().enumerate() {
         let mesh_idx = ctx.solution_to_mesh[solution_idx];
         let Some(slot) = mesh_assignments.get_mut(mesh_idx) else {
             warn!(
@@ -224,10 +301,10 @@ fn broadcast_partition(partition: &faer_amg::partitioners::Partition) {
         *slot = agg as u32;
     }
 
-    if let Err(err) = ctx
-        .runtime
-        .block_on(ctx.client.update_partition_from_mapping(mesh_assignments))
-    {
+    if let Err(err) = ctx.runtime.block_on(
+        ctx.client
+            .update_partition_from_mapping(mesh_assignments, Some(metrics)),
+    ) {
         warn!(
             "Failed to send partition update to visualization server for dataset {}: {err:?}. Disabling further updates.",
             ctx.dataset
@@ -326,7 +403,7 @@ fn smooth_vector(
     no_viz: bool,
 ) -> Mat<f64> {
     let mat_ref = mat.as_ref();
-    let l1_diag = new_l1(&mat_ref);
+    let l1_diag = new_l1(mat_ref);
 
     let bar = ProgressBar::new(iterations as u64);
 
@@ -370,6 +447,32 @@ fn smooth_vector(
     );
 
     x
+}
+
+fn smooth_vector_rand_svd(
+    mat: Arc<faer::sparse::SparseRowMat<usize, f64>>,
+    iterations: usize,
+    near_null_dim: usize,
+    no_viz: bool,
+) -> Mat<f64> {
+    let l1_diag = Arc::new(new_l1(mat.as_ref().as_ref()));
+
+    let stationary = StationaryIteration::new(mat, l1_diag, iterations);
+    let (_u, s, v) = rand_svd(stationary, near_null_dim);
+
+    if !no_viz {
+        let to_visualize = v.col(0);
+        visualize(to_visualize);
+    }
+
+    let convergence_factors: String = s
+        .into_column_vector()
+        .iter()
+        .map(|singular_value| format!("{:.2} ", singular_value.powf((iterations as f64).recip())))
+        .collect();
+    info!("converge factor: {}", convergence_factors);
+
+    v
 }
 
 fn visualize(vec: ColRef<f64>) {

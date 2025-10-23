@@ -1,20 +1,28 @@
-use std::{collections::BTreeSet, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashMap},
+    rc::Rc,
+    sync::Arc,
+};
 
 use faer::{
     sparse::{SparseRowMat, SparseRowMatRef},
     Col, ColRef, Mat, MatRef,
 };
 use log::info;
-use rayon::iter::{IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator};
+use petgraph::{graph::NodeIndex, Graph, Undirected};
+use rayon::iter::{
+    IntoParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator,
+};
 
-mod modularity;
+pub mod modularity;
+pub mod multilevel;
 pub use modularity::ModularityPartitioner;
 
 // NOTE: for now no generics, will refactor to fully generic interfaces when API stabilizes...
+pub type PartitionerCallback = Arc<dyn Fn(usize, &ModularityPartitioner) + Send + Sync>;
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Partition {
-    mat: Arc<SparseRowMat<usize, f64>>,
     node_to_agg: Vec<usize>,
     agg_to_node: Vec<BTreeSet<usize>>,
 }
@@ -59,11 +67,10 @@ impl Partition {
             max_agg
         );
     }
-    pub fn singleton(mat: Arc<SparseRowMat<usize, f64>>) -> Self {
-        let node_to_agg = (0..mat.nrows()).collect();
-        let agg_to_node = (0..mat.nrows()).map(|i| BTreeSet::from([i])).collect();
+    pub fn singleton(n_nodes: usize) -> Self {
+        let node_to_agg = (0..n_nodes).collect();
+        let agg_to_node = (0..n_nodes).map(|i| BTreeSet::from([i])).collect();
         Self {
-            mat,
             node_to_agg,
             agg_to_node,
         }
@@ -91,9 +98,8 @@ impl Partition {
         self.agg_to_node = new_aggs;
     }
 
-    pub fn from_node_to_agg(mat: Arc<SparseRowMat<usize, f64>>, node_to_agg: Vec<usize>) -> Self {
+    pub fn from_node_to_agg(node_to_agg: Vec<usize>) -> Self {
         let mut new_part = Self {
-            mat,
             agg_to_node: Vec::new(),
             node_to_agg,
         };
@@ -101,12 +107,8 @@ impl Partition {
         new_part
     }
 
-    pub fn from_agg_to_node(
-        mat: Arc<SparseRowMat<usize, f64>>,
-        agg_to_node: Vec<BTreeSet<usize>>,
-    ) -> Self {
+    pub fn from_agg_to_node(agg_to_node: Vec<BTreeSet<usize>>) -> Self {
         let mut new_part = Self {
-            mat,
             agg_to_node,
             node_to_agg: Vec::new(),
         };
@@ -166,45 +168,62 @@ impl Partition {
     }
 }
 
-pub struct PartitionBuilder {
+pub struct PartitionBuilder<'a> {
     pub mat: Arc<SparseRowMat<usize, f64>>,
-    pub near_null: Mat<f64>,
+    pub block_size: usize,
+    pub near_null: MatRef<'a, f64>,
     pub coarsening_factor: f64,
     pub agg_size_penalty: f64,
+    pub dist_penalty: f64,
     pub max_improvement_iters: usize,
+    pub callback: Option<PartitionerCallback>,
 }
 
-impl PartitionBuilder {
+impl<'a> PartitionBuilder<'a> {
     pub fn new(
         mat: Arc<SparseRowMat<usize, f64>>,
-        near_null: Mat<f64>,
+        block_size: usize,
+        near_null: MatRef<'a, f64>,
         coarsening_factor: f64,
         agg_size_penalty: f64,
+        dist_penalty: f64,
         max_improvement_iters: usize,
     ) -> Self {
         Self {
             mat,
+            block_size,
             near_null,
             coarsening_factor,
             agg_size_penalty,
+            dist_penalty,
             max_improvement_iters,
+            callback: None,
         }
     }
 
     pub fn create_partitioner(&self) -> ModularityPartitioner {
-        let strength =
+        let mut strength =
             AdjacencyList::new_strength_graph(self.mat.as_ref().as_ref(), self.near_null.as_ref());
+        if self.block_size > 1 {
+            let node_to_agg = (0..self.mat.nrows())
+                .map(|node_id| node_id / self.block_size)
+                .collect();
+            let block_reduce = Partition::from_node_to_agg(node_to_agg);
+            strength.aggregate(&block_reduce);
+            strength.filter_diag();
+        }
         ModularityPartitioner::new(
-            self.mat.clone(),
             strength,
             self.coarsening_factor,
             self.agg_size_penalty,
+            self.dist_penalty,
+            self.callback.clone(),
         )
     }
 
     pub fn build(&self) -> Partition {
         let mut partitioner = self.create_partitioner();
-        partitioner.partition();
+        partitioner.partition(self.coarsening_factor);
         partitioner.improve(self.max_improvement_iters);
         partitioner.into_partition()
     }
@@ -218,15 +237,32 @@ pub(crate) struct AdjacencyList {
 impl AdjacencyList {
     pub fn new_strength_graph(mat: SparseRowMatRef<usize, f64>, near_null: MatRef<f64>) -> Self {
         let mut nodes = vec![Vec::new(); mat.ncols()];
+        let mut max_w = 0.0;
         for triplet in mat.triplet_iter() {
             let mut strength = 0.0;
             if triplet.row != triplet.col {
                 for vec in near_null.col_iter() {
                     strength += -vec[triplet.row] * triplet.val * vec[triplet.col];
                 }
+                if strength > max_w {
+                    max_w = strength;
+                }
                 nodes[triplet.row].push((triplet.col, strength));
             }
         }
+
+        let min_strength = 1e-4;
+
+        nodes.par_iter_mut().for_each(|neighborhood| {
+            for (_, strength) in neighborhood.iter_mut() {
+                if *strength > 0.0 {
+                    *strength /= max_w;
+                }
+                if *strength < min_strength {
+                    *strength = min_strength;
+                }
+            }
+        });
 
         Self { nodes }
     }
@@ -266,11 +302,32 @@ impl AdjacencyList {
 
     pub fn aggregate(&mut self, partition: &Partition) {
         self.map_indices(&partition.node_to_agg);
-        self.nodes = partition
+        let neighborhoods: Vec<(Vec<(usize, f64)>, f64)> = partition
             .agg_to_node
             .par_iter()
             .map(|agg| self.merge_agg(agg))
             .collect();
+        let max: f64 = neighborhoods
+            .iter()
+            .map(|(_, local_max_strength)| *local_max_strength)
+            .max_by(|a, b| a.partial_cmp(b).unwrap())
+            .unwrap();
+
+        self.nodes = neighborhoods
+            .into_par_iter()
+            .map(|(mut neighborhood, _)| {
+                for (_, strength) in neighborhood.iter_mut() {
+                    *strength /= max;
+                }
+                neighborhood
+            })
+            .collect();
+    }
+
+    pub fn filter_diag(&mut self) {
+        for (node_i, row) in self.nodes.iter_mut().enumerate() {
+            row.retain(|(node_j, _)| *node_j != node_i);
+        }
     }
 
     fn map_indices(&mut self, agg_ids: &Vec<usize>) {
@@ -321,10 +378,102 @@ impl AdjacencyList {
                 None => merged.push(to_add),
             }
         }
+
+        while idx_i < len_i {
+            let to_add = neighbors_i[idx_i];
+            match merged.last_mut() {
+                Some(pair) => {
+                    if to_add.0 == pair.0 {
+                        pair.1 += to_add.1;
+                    } else {
+                        merged.push(to_add);
+                    }
+                }
+                None => merged.push(to_add),
+            }
+            idx_i += 1;
+        }
+
+        while idx_j < len_j {
+            let to_add = neighbors_j[idx_j];
+            match merged.last_mut() {
+                Some(pair) => {
+                    if to_add.0 == pair.0 {
+                        pair.1 += to_add.1;
+                    } else {
+                        merged.push(to_add);
+                    }
+                }
+                None => merged.push(to_add),
+            }
+            idx_j += 1;
+        }
         merged
     }
 
-    fn merge_agg(&self, _agg: &BTreeSet<usize>) -> Vec<(usize, f64)> {
-        unimplemented!()
+    fn merge_agg(&self, agg: &BTreeSet<usize>) -> (Vec<(usize, f64)>, f64) {
+        // Bad complexity, use tournament tree...
+        let mut combined: Vec<(usize, f64)> = agg
+            .iter()
+            .copied()
+            .map(|node_id| self.nodes[node_id].iter().copied())
+            .flatten()
+            .collect();
+        combined.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+        let mut write_idx = 0;
+        let mut read_idx = 1;
+        while read_idx < combined.len() {
+            if combined[write_idx].0 == combined[read_idx].0 {
+                combined[write_idx].1 += combined[read_idx].1;
+                read_idx += 1;
+            } else {
+                write_idx += 1;
+                if write_idx < read_idx {
+                    combined[write_idx] = combined[read_idx];
+                }
+                read_idx += 1;
+            }
+        }
+        combined.truncate(write_idx + 1);
+        let local_max = *combined
+            .iter()
+            .map(|(_, strength)| strength)
+            .max_by(|a, b| a.partial_cmp(b).unwrap())
+            .unwrap();
+
+        (combined, local_max)
     }
+
+    fn subgraph(&self, aggregate: &BTreeSet<usize>) -> AggregateGraph {
+        let mut agg_graph = Graph::new_undirected();
+        let mut index_map = HashMap::new();
+        for node_i in aggregate.iter().copied() {
+            let node_idx = agg_graph.add_node(());
+            index_map.insert(node_i, node_idx);
+        }
+
+        for node_i in aggregate.iter().copied() {
+            let neighborhood = &self.nodes[node_i];
+            let node_idx_i = *index_map.get(&node_i).expect("invalid partition or graph");
+            for (node_j, weight) in neighborhood
+                .iter()
+                .copied()
+                .filter(|(node_j, _)| *node_j > node_i)
+            {
+                if let Some(node_idx_j) = index_map.get(&node_j) {
+                    agg_graph.add_edge(node_idx_i, *node_idx_j, weight.recip());
+                }
+            }
+        }
+        AggregateGraph {
+            graph: agg_graph,
+            index_map,
+        }
+    }
+}
+
+struct AggregateGraph {
+    graph: Graph<(), f64, Undirected>,
+    index_map: HashMap<usize, NodeIndex>,
 }
