@@ -5,7 +5,7 @@ use std::{
 };
 
 use faer::{
-    sparse::{SparseRowMat, Triplet},
+    sparse::{SparseRowMat, SparseRowMatRef, Triplet},
     Mat,
 };
 use sci_bevy_comm::{load_triangle_mesh_data, MeshGeometry};
@@ -36,6 +36,117 @@ pub fn mats_are_equal(left: &SparseRowMat<usize, f64>, right: &SparseRowMat<usiz
         }
     }
     true
+}
+
+#[derive(Debug, Clone)]
+pub struct MatrixStats {
+    pub rows: usize,
+    pub cols: usize,
+    pub nnz: usize,
+    pub sparsity: f64,
+    pub entries_min: f64,
+    pub entries_max: f64,
+    pub entries_avg: f64,
+    pub weight_min: f64,
+    pub weight_max: f64,
+    pub weight_avg: f64,
+    pub rowsum_min: f64,
+    pub rowsum_max: f64,
+    pub rowsum_avg: f64,
+}
+
+pub fn matrix_stats(mat: SparseRowMatRef<usize, f64>) -> MatrixStats {
+    let rows = mat.nrows();
+    let cols = mat.ncols();
+    let nnz = mat.compute_nnz();
+    let total_entries = nnz as f64;
+
+    let mut entries_min = f64::INFINITY;
+    let mut entries_max = 0.0f64;
+    let mut entries_sum = 0.0f64;
+
+    let mut weight_min = f64::INFINITY;
+    let mut weight_max = f64::NEG_INFINITY;
+    let mut weight_sum = 0.0f64;
+
+    let mut rowsum_min = f64::INFINITY;
+    let mut rowsum_max = f64::NEG_INFINITY;
+    let mut rowsum_sum = 0.0f64;
+
+    for row in 0..rows {
+        let values = mat.val_of_row(row);
+        let entries = values.len() as f64;
+        entries_min = entries_min.min(entries);
+        entries_max = entries_max.max(entries);
+        entries_sum += entries;
+
+        let rowsum: f64 = values.iter().copied().sum();
+        rowsum_min = rowsum_min.min(rowsum);
+        rowsum_max = rowsum_max.max(rowsum);
+        rowsum_sum += rowsum;
+
+        for &val in values {
+            weight_min = weight_min.min(val);
+            weight_max = weight_max.max(val);
+            weight_sum += val;
+        }
+    }
+
+    if entries_min.is_infinite() {
+        entries_min = 0.0;
+    }
+    if weight_min.is_infinite() {
+        weight_min = 0.0;
+    }
+    if weight_max.is_infinite() {
+        weight_max = 0.0;
+    }
+    if rowsum_min.is_infinite() {
+        rowsum_min = 0.0;
+    }
+    if rowsum_max.is_infinite() {
+        rowsum_max = 0.0;
+    }
+
+    let entries_avg = if rows > 0 {
+        entries_sum / rows as f64
+    } else {
+        0.0
+    };
+
+    let weight_avg = if total_entries > 0.0 {
+        weight_sum / total_entries
+    } else {
+        0.0
+    };
+
+    let rowsum_avg = if rows > 0 {
+        rowsum_sum / rows as f64
+    } else {
+        0.0
+    };
+
+    let sparsity = if rows == 0 || cols == 0 {
+        0.0
+    } else {
+        nnz as f64 / (rows as f64 * cols as f64)
+    };
+
+    MatrixStats {
+        rows,
+        cols,
+        nnz,
+        sparsity,
+        entries_min,
+        entries_max,
+        entries_avg,
+        weight_min,
+        weight_max,
+        weight_avg,
+        rowsum_min,
+        rowsum_max,
+        rowsum_avg,
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -4,25 +4,15 @@ use clap::{Parser, ValueEnum};
 use env_logger;
 use faer::{
     dyn_stack::{MemBuffer, MemStack, StackReq},
-    matrix_free::{
-        conjugate_gradient::{
-            conjugate_gradient, conjugate_gradient_scratch, CgError, CgInfo, CgParams,
-        },
-        BiPrecond, LinOp,
+    matrix_free::conjugate_gradient::{
+        conjugate_gradient, conjugate_gradient_scratch, CgError, CgInfo, CgParams,
     },
     sparse::SparseRowMat,
-    Col, Mat,
+    Col,
 };
 use faer_amg::{
     adaptivity::smooth_vector_rand_svd,
-    interpolation::smoothed_aggregation,
-    partitioners::{Partition, PartitionBuilder},
-    preconditioners::{
-        block_smoothers::{BlockSmoother, BlockSmootherType},
-        coarse_solvers::DenseCholeskySolve,
-        multigrid::MultiGrid,
-        smoothers::{new_l1, StationaryIteration},
-    },
+    hierarchy::{AddLevelParams, Hierarchy, HierarchyError, MultigridBuilder, PartitionStrategy},
     utils::load_mfem_linear_system,
 };
 use log::{info, warn, LevelFilter};
@@ -152,26 +142,68 @@ fn main() -> Result<(), Box<dyn Error>> {
     let fine_near_null =
         smooth_vector_rand_svd(matrix.clone(), cli.smoothing_iters, cli.near_null_dim);
 
-    let hierarchy = build_hierarchy(&cli, matrix.clone(), fine_near_null);
+    let size_penalty = 1e-1;
+    let dist_penalty = 1e-6;
+    let mut hierarchy = Hierarchy::new(matrix.clone(), fine_near_null, cli.block_size);
+    hierarchy.set_partition_strategy(PartitionStrategy::new(
+        size_penalty,
+        dist_penalty,
+        cli.aggregation_iters,
+    ));
 
-    let (level_mats, restrictions, interpolations, smoothers) = hierarchy;
+    loop {
+        let current_mat = hierarchy.current_mat();
+        if current_mat.nrows() <= cli.coarsest_dim {
+            info!(
+                "Stopping coarsening at level with {} unknowns (<= coarsest_dim {}).",
+                current_mat.nrows(),
+                cli.coarsest_dim
+            );
+            break;
+        }
+
+        let block_size = hierarchy.current_block_size();
+        let block_ratio = cli.near_null_dim as f64 / block_size as f64;
+        let coarsening_factor = cli.coarsening_factor * block_ratio;
+        match hierarchy.add_level(AddLevelParams {
+            coarsening_factor,
+            coarse_block_size: cli.near_null_dim,
+            partition: None,
+        }) {
+            Ok(coarse_size) => {
+                if coarse_size <= cli.coarsest_dim {
+                    info!(
+                        "Stopping coarsening at level with {} unknowns (<= coarsest_dim {}).",
+                        coarse_size, cli.coarsest_dim
+                    );
+                    break;
+                }
+            }
+            Err(HierarchyError::CoarseningDidNotReduce) => {
+                info!(
+                    "Reached terminal level with {} DOFs; no further coarsening possible.",
+                    current_mat.nrows()
+                );
+                break;
+            }
+            Err(err) => return Err(Box::new(err)),
+        }
+    }
+
     info!(
         "Constructed multigrid hierarchy with {} levels",
-        level_mats.len()
+        hierarchy.levels()
     );
+    info!("{:?}", hierarchy);
 
-    let mut multigrid = MultiGrid::new(
-        level_mats[0].clone() as Arc<dyn LinOp<f64> + Send>,
-        smoothers[0].clone(),
+    let mut multigrid = MultigridBuilder::new()
+        .build(&hierarchy)
+        .map_err(|err| -> Box<dyn Error> { Box::new(err) })?;
+    info!(
+        "Constructed multigrid with {} operators and cycle type {}",
+        multigrid.levels(),
+        multigrid.cycle_type()
     );
-
-    for level in 0..restrictions.len() {
-        let op = level_mats[level + 1].clone() as Arc<dyn LinOp<f64> + Send>;
-        let smoother = smoothers[level + 1].clone();
-        let r = restrictions[level].clone();
-        let p = interpolations[level].clone();
-        multigrid.add_level(op, smoother, r, p);
-    }
 
     info!(
         "Running PCG solve with tolerance {:.2e} and max {} iterations",
@@ -254,150 +286,4 @@ fn system_path(cli: &Cli) -> (PathBuf, String) {
         .join(coef_dir);
     let dataset_name = format!("h{}_p1", cli.refinements);
     (data_dir, dataset_name)
-}
-
-fn build_hierarchy(
-    cli: &Cli,
-    matrix: Arc<SparseRowMat<usize, f64>>,
-    fine_near_null: Mat<f64>,
-) -> (
-    Vec<Arc<SparseRowMat<usize, f64>>>,
-    Vec<Arc<dyn LinOp<f64> + Send>>,
-    Vec<Arc<dyn LinOp<f64> + Send>>,
-    Vec<Arc<dyn BiPrecond<f64> + Send>>,
-) {
-    let size_penalty = 1e-1;
-    let dist_penalty = 1e-6;
-    let block_smoother_cf = cli.block_smoother_size as f64;
-
-    let mut level_mats = vec![matrix.clone()];
-    let mut level_near_nulls = vec![fine_near_null];
-    let mut level_block_sizes = vec![cli.block_size];
-    let mut restrictions: Vec<Arc<dyn LinOp<f64> + Send>> = Vec::new();
-    let mut interpolations: Vec<Arc<dyn LinOp<f64> + Send>> = Vec::new();
-
-    let par = faer::get_global_parallelism();
-    let mut buf = MemBuffer::new(StackReq::empty());
-    let stack = MemStack::new(&mut buf);
-
-    loop {
-        let level_idx = level_mats.len() - 1;
-        let mat = level_mats[level_idx].clone();
-        if mat.nrows() <= cli.coarsest_dim {
-            info!(
-                "Stopping coarsening at level with {} unknowns (<= coarsest_dim {}).",
-                mat.nrows(),
-                cli.coarsest_dim
-            );
-            break;
-        }
-        let block_size = level_block_sizes[level_idx];
-
-        let mut partition;
-        if block_size == 1 {
-            partition = Partition::singleton(mat.nrows());
-        } else {
-            let node_to_agg = (0..mat.nrows())
-                .map(|node_id| node_id / block_size)
-                .collect();
-            partition = Partition::from_node_to_agg(node_to_agg);
-        }
-
-        let scalar_partition = {
-            let near_null_ref = level_near_nulls[level_idx].as_ref();
-            let block_ratio = cli.near_null_dim as f64 / block_size as f64;
-            let coarsening_factor = cli.coarsening_factor * block_ratio;
-            PartitionBuilder::new(
-                mat.clone(),
-                block_size,
-                near_null_ref,
-                coarsening_factor,
-                size_penalty,
-                dist_penalty,
-                cli.aggregation_iters,
-            )
-            .build()
-        };
-        partition.compose(&scalar_partition);
-
-        if partition.naggs() == mat.nrows() {
-            info!(
-                "Reached terminal level with {} DOFs; no further coarsening possible.",
-                mat.nrows()
-            );
-            break;
-        }
-
-        let (coarse_near_null, restriction_mat, interpolation_mat, coarse_mat) = {
-            let near_null_ref = level_near_nulls[level_idx].as_ref();
-            smoothed_aggregation(mat.as_ref().as_ref(), &partition, block_size, near_null_ref)
-        };
-
-        info!(
-            "Level {} -> {} DOFs ({} aggregates)",
-            mat.nrows(),
-            coarse_mat.nrows(),
-            partition.naggs()
-        );
-
-        let coarse_mat = Arc::new(coarse_mat);
-        let prec = Arc::new(new_l1(coarse_mat.as_ref().as_ref())) as Arc<dyn LinOp<f64> + Send>;
-        let iters = 5;
-        let near_null_smoother = StationaryIteration::new(coarse_mat.clone(), prec, iters);
-        let mut out = Mat::zeros(coarse_near_null.nrows(), coarse_near_null.ncols());
-        near_null_smoother.apply(out.as_mut(), coarse_near_null.as_ref(), par, stack);
-        let coarse_near_null = out.qr().compute_thin_Q();
-
-        let restriction_arc = Arc::new(restriction_mat);
-        let interpolation_arc = Arc::new(interpolation_mat);
-        restrictions.push(restriction_arc.clone() as Arc<dyn LinOp<f64> + Send>);
-        interpolations.push(interpolation_arc.clone() as Arc<dyn LinOp<f64> + Send>);
-
-        level_mats.push(coarse_mat);
-        level_near_nulls.push(coarse_near_null);
-        level_block_sizes.push(cli.near_null_dim);
-    }
-
-    let level_count = level_mats.len();
-    let mut smoothers: Vec<Arc<dyn BiPrecond<f64> + Send>> = Vec::with_capacity(level_count);
-    for idx in 0..level_count {
-        let mat = level_mats[idx].clone();
-        if idx + 1 == level_count {
-            let solver = DenseCholeskySolve::from_sparse(mat.as_ref().as_ref())
-                .expect("failed to factorize coarsest grid with dense Cholesky");
-            smoothers.push(Arc::new(solver));
-        } else {
-            let near_null = level_near_nulls[idx].as_ref();
-            let block_size = level_block_sizes[idx];
-            let mut partition;
-            if block_size == 1 {
-                partition = Partition::singleton(mat.nrows());
-            } else {
-                let node_to_agg = (0..mat.nrows())
-                    .map(|node_id| node_id / block_size)
-                    .collect();
-                partition = Partition::from_node_to_agg(node_to_agg);
-            }
-            let scalar_partition = PartitionBuilder::new(
-                mat.clone(),
-                block_size,
-                near_null,
-                block_smoother_cf,
-                size_penalty,
-                dist_penalty,
-                cli.aggregation_iters,
-            )
-            .build();
-            partition.compose(&scalar_partition);
-            let partition = Arc::new(partition);
-            smoothers.push(Arc::new(BlockSmoother::new(
-                mat.as_ref().as_ref(),
-                partition,
-                BlockSmootherType::SparseCholesky,
-                block_size,
-            )) as Arc<dyn BiPrecond<f64> + Send>);
-        }
-    }
-
-    (level_mats, restrictions, interpolations, smoothers)
 }

@@ -1,14 +1,13 @@
 use std::{
     collections::{BTreeSet, HashMap},
-    rc::Rc,
+    fmt,
     sync::Arc,
 };
 
 use faer::{
     sparse::{SparseRowMat, SparseRowMatRef},
-    Col, ColRef, Mat, MatRef,
+    MatRef,
 };
-use log::info;
 use petgraph::{graph::NodeIndex, Graph, Undirected};
 use rayon::iter::{
     IntoParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator,
@@ -21,10 +20,20 @@ pub use modularity::ModularityPartitioner;
 // NOTE: for now no generics, will refactor to fully generic interfaces when API stabilizes...
 pub type PartitionerCallback = Arc<dyn Fn(usize, &ModularityPartitioner) + Send + Sync>;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Partition {
     node_to_agg: Vec<usize>,
     agg_to_node: Vec<BTreeSet<usize>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PartitionStats {
+    pub aggs: usize,
+    pub nodes: usize,
+    pub cf: f64,
+    pub agg_size_min: usize,
+    pub agg_size_max: usize,
+    pub agg_size_avg: f64,
 }
 
 impl Partition {
@@ -48,25 +57,6 @@ impl Partition {
         &self.agg_to_node
     }
 
-    pub fn info(&self) {
-        let mut max_agg = usize::MIN;
-        let mut min_agg = usize::MAX;
-        for agg in self.agg_to_node.iter() {
-            if agg.len() > max_agg {
-                max_agg = agg.len();
-            }
-            if agg.len() < min_agg {
-                min_agg = agg.len();
-            }
-        }
-        info!(
-            "Partition has {} aggs ({:.2} avg size) with min size of {} and max size of {}",
-            self.agg_to_node.len(),
-            self.node_to_agg.len() as f64 / self.agg_to_node.len() as f64,
-            min_agg,
-            max_agg
-        );
-    }
     pub fn singleton(n_nodes: usize) -> Self {
         let node_to_agg = (0..n_nodes).collect();
         let agg_to_node = (0..n_nodes).map(|i| BTreeSet::from([i])).collect();
@@ -165,6 +155,63 @@ impl Partition {
 
     pub fn aggregate_sizes(&self) -> Vec<usize> {
         self.agg_to_node.iter().map(|agg| agg.len()).collect()
+    }
+
+    pub fn info(&self) -> PartitionStats {
+        let aggs = self.naggs();
+        let nodes = self.nnodes();
+        if aggs == 0 {
+            return PartitionStats {
+                aggs,
+                nodes,
+                cf: 0.0,
+                agg_size_min: 0,
+                agg_size_max: 0,
+                agg_size_avg: 0.0,
+            };
+        }
+        let mut min_size = usize::MAX;
+        let mut max_size = 0usize;
+        let mut sum = 0usize;
+        for agg in &self.agg_to_node {
+            let size = agg.len();
+            min_size = min_size.min(size);
+            max_size = max_size.max(size);
+            sum += size;
+        }
+        if min_size == usize::MAX {
+            min_size = 0;
+        }
+        let avg = if aggs > 0 {
+            sum as f64 / aggs as f64
+        } else {
+            0.0
+        };
+
+        PartitionStats {
+            aggs,
+            nodes,
+            cf: self.cf(),
+            agg_size_min: min_size,
+            agg_size_max: max_size,
+            agg_size_avg: avg,
+        }
+    }
+}
+
+impl fmt::Debug for Partition {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let stats = self.info();
+        write!(
+            f,
+            "Partition {{ aggs: {}, nodes: {}, cf: {:.2}, agg_size_min: {}, agg_size_max: {}, agg_size_avg: {:.2} }}",
+            stats.aggs,
+            stats.nodes,
+            stats.cf,
+            stats.agg_size_min,
+            stats.agg_size_max,
+            stats.agg_size_avg,
+        )
     }
 }
 

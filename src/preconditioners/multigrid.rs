@@ -50,6 +50,14 @@ impl MultiGrid {
         self.restrictions.push(r);
     }
 
+    pub fn levels(&self) -> usize {
+        self.operators.len()
+    }
+
+    pub fn cycle_type(&self) -> usize {
+        self.cycle_type
+    }
+
     fn init_cycle(
         &self,
         mut out: MatMut<'_, f64>,

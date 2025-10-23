@@ -6,7 +6,27 @@ use faer::{
     Col, Mat, MatRef,
 };
 
-use crate::partitioners::Partition;
+use crate::{
+    partitioners::Partition,
+    utils::{matrix_stats, MatrixStats},
+};
+
+#[derive(Clone, Debug)]
+pub struct InterpolationInfo {
+    pub stats: MatrixStats,
+}
+
+impl InterpolationInfo {
+    pub fn new(p: &SparseRowMat<usize, f64>) -> Self {
+        Self {
+            stats: matrix_stats(p.as_ref()),
+        }
+    }
+
+    pub fn stats(&self) -> &MatrixStats {
+        &self.stats
+    }
+}
 
 pub fn smoothed_aggregation(
     fine_mat: SparseRowMatRef<usize, f64>,
