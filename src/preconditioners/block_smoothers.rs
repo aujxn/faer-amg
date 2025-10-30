@@ -7,83 +7,109 @@ use faer::{
     dyn_stack::{MemBuffer, MemStack, StackReq},
     matrix_free::{BiLinOp, BiPrecond, LinOp, Precond},
     prelude::ReborrowMut,
-    sparse::{SparseRowMat, SparseRowMatRef, Triplet},
+    sparse::{ops::sub_assign, SparseRowMat, SparseRowMatRef, Triplet},
     traits::MulByRef,
     Mat, MatMut, MatRef, Par,
 };
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
-use crate::{partitioners::Partition, preconditioners::smoothers::CholeskySolve};
+use crate::{
+    core::SparseMatOp,
+    partitioners::{Partition, PartitionerConfig},
+    preconditioners::coarse_solvers::CoarseSolverKind,
+};
 
 #[derive(Copy, Clone, Debug)]
 #[non_exhaustive]
-pub enum BlockSmootherType {
+pub enum BlockSmootherKind {
     /// Performs one symmetric Gauss-Seidel sweep per block.
     GaussSeidel,
     /// Decomposes each block into LDL^T with no fill-in. Resulting decomposition has same sparsity
     /// pattern as the block matrix created by removing connections between aggregates in the
     /// partition.
     IncompleteCholesky,
-    /// If the sparsity of a block is below 30% then solve with sparse Cholesky decomposition but
-    /// otherwise just use dense Cholesky decompositions. Warning: large blocks can consume lots of
-    /// memory even when the sparse decomposition is done.
-    AutoCholesky,
-    /// Solve each block by cacheing a sparse Cholesky decomposition of each block using the
-    /// provided reordering. Warning: If blocks are large and the reordering approach doesn't
-    /// effectively reduce fill in this can consume lots of memory.
-    SparseCholesky,
-    /// Solve each block by cacheing a dense Cholesky decomposition of each block. Warning: if the
-    /// blocks are large this can consume all available memory very quickly.
-    DenseCholesky,
-    /// Solve each block to a relative accuracy provided (1e-6 is probably okay most the time but
-    /// problem dependent) iteratively with conjugate gradient.
-    ConjugateGradient(f64),
+    /// Solves each block with a specified solver.
+    BlockSolver(CoarseSolverKind),
+}
+
+#[derive(Debug, Clone)]
+pub struct BlockSmootherConfig {
+    pub block_smoother_kind: BlockSmootherKind,
+    pub partitioner_config: PartitionerConfig,
+}
+
+impl Default for BlockSmootherConfig {
+    fn default() -> Self {
+        Self {
+            block_smoother_kind: BlockSmootherKind::BlockSolver(CoarseSolverKind::Cholesky),
+            partitioner_config: PartitionerConfig::default(),
+        }
+    }
+}
+
+impl BlockSmootherConfig {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn build(&self, base_matrix: SparseMatOp, partition: Arc<Partition>) -> BlockSmoother {
+        BlockSmoother::new(base_matrix, partition, self.block_smoother_kind)
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct BlockSmoother {
     partition: Arc<Partition>,
-    blocks: Vec<Arc<dyn BiPrecond<f64> + Send + Sync>>,
+    blocks: Vec<Arc<dyn BiPrecond<f64> + Send>>,
     dim: usize,
+    vdim: usize,
 }
 
 impl BlockSmoother {
-    pub fn new(
-        mat: SparseRowMatRef<usize, f64>,
-        partition: Arc<Partition>,
-        smoother: BlockSmootherType,
-        vdim: usize,
-    ) -> Self {
-        let blocks: Vec<Arc<dyn BiPrecond<f64> + Send + Sync>> = partition
+    fn new(op: SparseMatOp, partition: Arc<Partition>, smoother: BlockSmootherKind) -> Self {
+        let vdim = op.block_size();
+        let mat = op.mat_ref();
+        assert_eq!(mat.nrows(), partition.nnodes() * vdim);
+        let blocks: Vec<Arc<dyn BiPrecond<f64> + Send>> = partition
             .aggregates()
             .par_iter()
             .map(|agg| {
                 let csr = if vdim == 1 {
                     Self::diagonally_compensate(agg, mat)
                 } else {
+                    /*
+                    let agg = agg
+                        .iter()
+                        .map(|block_i| {
+                            (0..vdim)
+                                .map(|offset_i| block_i * vdim + offset_i)
+                                .collect::<Vec<_>>()
+                        })
+                        .flatten()
+                        .collect();
+                    Self::diagonally_compensate(&agg, mat)
+                    */
                     Self::diagonally_compensate_vector(agg, mat, vdim)
                 };
+                /*
+                let mut test = csr.clone().into_transpose();
+                sub_assign(test.as_dyn_mut(), csr.transpose());
+                for v in test.val().iter() {
+                    if v.abs() > 1e-10 {
+                        panic!("not symmetric submatrix");
+                    }
+                }
+                */
 
                 match smoother {
-                    BlockSmootherType::GaussSeidel => {
+                    BlockSmootherKind::GaussSeidel => {
                         unimplemented!()
                     }
-                    BlockSmootherType::IncompleteCholesky => {
+                    BlockSmootherKind::IncompleteCholesky => {
                         unimplemented!()
                     }
-                    BlockSmootherType::AutoCholesky => {
-                        unimplemented!()
-                    }
-                    BlockSmootherType::DenseCholesky => {
-                        unimplemented!()
-                    }
-                    BlockSmootherType::SparseCholesky => {
-                        let pc: Arc<dyn BiPrecond<f64> + Sync + Send> =
-                            Arc::new(CholeskySolve::new(csr.as_ref()));
-                        pc
-                    }
-                    BlockSmootherType::ConjugateGradient(_tolerance) => {
-                        unimplemented!()
+                    BlockSmootherKind::BlockSolver(coarse_solver_kind) => {
+                        coarse_solver_kind.build_from_sparse(csr.as_ref())
                     }
                 }
             })
@@ -93,6 +119,7 @@ impl BlockSmoother {
             partition,
             blocks,
             dim: mat.nrows(),
+            vdim,
         }
     }
 
@@ -134,32 +161,44 @@ impl BlockSmoother {
         mat: SparseRowMatRef<usize, f64>,
         vdim: usize,
     ) -> SparseRowMat<usize, f64> {
-        let block_size = agg.len();
-        assert_eq!(block_size % vdim, 0);
+        let block_size = agg.len() * vdim;
         let agg: Vec<usize> = agg.iter().copied().collect();
         let mut block_triplets = Vec::new();
         let symbolic = mat.symbolic();
 
         let mut to_compensate = HashSet::new();
+        let mut diag: Vec<Mat<f64>> = vec![Mat::zeros(vdim, vdim); agg.len()];
 
-        for (ic, i) in agg.iter().copied().enumerate() {
-            let values_row_i = mat.val_of_row(i);
-            for (j, val) in symbolic.col_idx_of_row(i).zip(values_row_i.iter()) {
-                match agg.binary_search(&j) {
-                    Ok(jc) => {
-                        block_triplets.push(Triplet::new(ic, jc, *val));
-                    }
-                    Err(_) => {
-                        let ic_start = ic - (ic % vdim);
-                        let i_start = i - (i % vdim);
-                        let j_start = j - (j % vdim);
-                        to_compensate.insert((ic_start, (i_start, j_start)));
+        for (block_ic, block_i) in agg.iter().copied().enumerate() {
+            for offset_i in 0..vdim {
+                let i = block_i * vdim + offset_i;
+                let ic = block_ic * vdim + offset_i;
+                let values_row_i = mat.val_of_row(i);
+                for (j, val) in symbolic.col_idx_of_row(i).zip(values_row_i.iter()) {
+                    let block_j = j / vdim;
+                    let offset_j = j % vdim;
+
+                    if block_j == block_i {
+                        assert_eq!(diag[block_ic][(offset_i, offset_j)], 0.0);
+                        diag[block_ic][(offset_i, offset_j)] = *val;
+                    } else {
+                        match agg.binary_search(&block_j) {
+                            Ok(block_jc) => {
+                                let jc = block_jc * vdim + offset_j;
+                                block_triplets.push(Triplet::new(ic, jc, *val));
+                            }
+                            Err(_) => {
+                                let i_start = i - offset_i;
+                                let j_start = j - offset_j;
+                                to_compensate.insert((block_ic, (i_start, j_start)));
+                            }
+                        }
                     }
                 }
             }
         }
 
-        for (ic, (i, j)) in to_compensate {
+        for (block_ic, (i, j)) in to_compensate {
             let mut block_a_ij: Mat<f64> = Mat::zeros(vdim, vdim);
             for i_off in 0..vdim {
                 for j_off in 0..vdim {
@@ -172,14 +211,19 @@ impl BlockSmoother {
             let svd = block_a_ij.svd().unwrap();
             let u = svd.U();
             let s = svd.S();
-            let usut: Mat<f64> = u.mul_by_ref(&s.mul_by_ref(&u.transpose()));
+            let usut: Mat<f64> = u * (s * u.transpose());
 
+            diag[block_ic] += 0.5 * usut;
+        }
+
+        for (block_ic, diag_block) in diag.iter().enumerate() {
+            let ic = block_ic * vdim;
             for i_off in 0..vdim {
                 for j_off in 0..vdim {
                     block_triplets.push(Triplet::new(
                         ic + i_off,
                         ic + j_off,
-                        0.5 * usut[(i_off, j_off)],
+                        diag_block[(i_off, j_off)],
                     ));
                 }
             }
@@ -214,8 +258,16 @@ impl LinOp<f64> for BlockSmoother {
             .par_iter()
             .enumerate()
             .map(|(block_idx, agg)| {
-                let mut r_part = Mat::zeros(agg.len(), rhs.ncols());
-                for (i, mut part_row) in agg.iter().copied().zip(r_part.row_iter_mut()) {
+                let mut r_part = Mat::zeros(agg.len() * self.vdim, rhs.ncols());
+                for (i, mut part_row) in agg
+                    .iter()
+                    .map(|i| {
+                        let i = i * self.vdim;
+                        i..(i + self.vdim)
+                    })
+                    .flatten()
+                    .zip(r_part.row_iter_mut())
+                {
                     let rhs_row = rhs.row(i);
                     part_row.copy_from(rhs_row);
                 }
@@ -233,7 +285,15 @@ impl LinOp<f64> for BlockSmoother {
             .iter()
             .zip(self.partition.aggregates().iter())
         {
-            for (i, r_i) in agg.iter().copied().zip(smoothed_part.row_iter()) {
+            for (i, r_i) in agg
+                .iter()
+                .map(|i| {
+                    let i = i * self.vdim;
+                    i..(i + self.vdim)
+                })
+                .flatten()
+                .zip(smoothed_part.row_iter())
+            {
                 out.rb_mut().row_mut(i).copy_from(r_i);
             }
         }
@@ -264,6 +324,8 @@ impl BiLinOp<f64> for BlockSmoother {
         par: Par,
         stack: &mut MemStack,
     ) {
+        self.apply(out, rhs, par, stack);
+        /*
         let _stack = stack;
         // TODO: no allocate, use `MemStack`
         let smoothed_parts: Vec<Mat<f64>> = self
@@ -295,6 +357,7 @@ impl BiLinOp<f64> for BlockSmoother {
                 out.rb_mut().row_mut(i).copy_from(r_i);
             }
         }
+        */
     }
 
     fn adjoint_apply(

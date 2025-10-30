@@ -42,7 +42,7 @@ fn main() {
         );
 
         /*
-        let m = MultiGrid {
+        let m = Multigrid {
             operators: vec![Arc::new(mat)],
             interpolations: vec![],
             restrictions: vec![],

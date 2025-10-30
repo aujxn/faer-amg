@@ -15,7 +15,7 @@ use faer::{
     Col, MatMut, MatRef, Par,
 };
 use faer_amg::preconditioners::{
-    multigrid::MultiGrid,
+    multigrid::Multigrid,
     smoothers::{new_jacobi, CholeskySolve},
 };
 
@@ -202,7 +202,7 @@ fn main() {
         let simple_pc = new_jacobi(&arc_mat.as_ref().as_ref(), 0.66);
 
         let fine_smoother = Arc::new(new_jacobi(&arc_mat.as_ref().as_ref(), 0.66));
-        let mut mg_pc = MultiGrid::new(arc_mat.clone(), fine_smoother.clone());
+        let mut mg_pc = Multigrid::new(arc_mat.clone(), fine_smoother.clone());
 
         for level in 1..=refinement {
             let coarse_elements = base_elements * 2usize.pow((refinement - level) as u32);

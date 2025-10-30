@@ -1,14 +1,128 @@
-use std::sync::Arc;
-
+use crate::{
+    hierarchy::Hierarchy,
+    partitioners::{Partition, PartitionerConfig},
+    preconditioners::{block_smoothers::BlockSmootherConfig, coarse_solvers::CoarseSolverKind},
+};
 use faer::{
     dyn_stack::{MemStack, StackReq},
     matrix_free::{BiLinOp, BiPrecond, LinOp, Precond},
     reborrow::*,
     Mat, MatMut, MatRef, Par,
 };
+use std::sync::Arc;
 
+/// This builder helps construct multigrid preconditioners for basic configurations. The number of
+/// smoothing steps and the smoother configuration is the same for all levels in the hierarchy.
+///
+/// If `coarse_solver` is `None` then the same smoothing is applied on coarsest level instead of
+/// solving exactly. Default is Cholesky decomposition.
+///
+/// For more custom / complex configurations the `Multigrid::add_level` API can be used directly.
 #[derive(Debug, Clone)]
-pub struct MultiGrid {
+pub struct MultigridConfig {
+    pub mu: usize,
+    pub smoother_config: BlockSmootherConfig,
+    pub smoothing_steps: usize,
+    pub coarse_solver: Option<CoarseSolverKind>,
+}
+
+impl Default for MultigridConfig {
+    fn default() -> Self {
+        Self {
+            mu: 1,
+            smoother_config: BlockSmootherConfig::default(),
+            smoothing_steps: 1,
+            coarse_solver: Some(CoarseSolverKind::Cholesky),
+        }
+    }
+}
+
+impl MultigridConfig {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Constructs a `Multigrid` operator from this config.
+    pub fn build(&self, hierarchy: Hierarchy) -> Multigrid {
+        /*
+        pub fn build(&self, hierarchy: Hierarchy) -> Result<Multigrid, MultigridBuildError> {
+            if hierarchy.levels() == 0 {
+                return Err(MultigridBuildError::EmptyHierarchy);
+            }
+        */
+
+        let level_count = hierarchy.levels();
+        let mut smoothers: Vec<Arc<dyn BiPrecond<f64> + Send>> = Vec::with_capacity(level_count);
+
+        /*
+        let fine_near_null = hierarchy.get_near_null(0);
+        let fine_op = hierarchy.get_op(0);
+        let mut partition_config = hierarchy.get_config().partitioner_config.clone();
+        partition_config.coarsening_factor = 128.0;
+        partition_config.max_improvement_iters = 1000;
+        //partition_config.agg_size_penalty = 0.0;
+        let mut partitioner = partition_config.build(fine_op, fine_near_null, None);
+        let mut smoother_partitions = vec![Arc::new(partitioner.get_partition().clone())];
+        for part in hierarchy.partitions() {
+            partitioner.rebase(part.as_ref().clone());
+            smoother_partitions.push(Arc::new(partitioner.get_partition().clone()));
+        }
+        */
+        let mut partition_config = hierarchy.get_config().partitioner_config.clone();
+        partition_config.coarsening_factor = 128.0;
+        partition_config.max_improvement_iters = 300;
+        let mut smoother_partitions = vec![];
+        for level in 0..(level_count - 1) {
+            let op = hierarchy.get_op(level);
+            let near_null = hierarchy.get_near_null(level);
+            let partition = partition_config.build_partition(op, near_null);
+            smoother_partitions.push(Arc::new(partition));
+        }
+
+        for level in 0..level_count {
+            let smoother: Arc<dyn BiPrecond<f64> + Send> =
+                if level + 1 == level_count && self.coarse_solver.is_some() {
+                    let op = hierarchy.get_mat_ref(level);
+                    self.coarse_solver.unwrap().build_from_sparse(op)
+                } else {
+                    assert_ne!(level, level_count - 1);
+                    let op = hierarchy.get_op(level);
+                    Arc::new(
+                        self.smoother_config
+                            .build(op, smoother_partitions[level].clone()),
+                    )
+                };
+            smoothers.push(smoother);
+        }
+
+        let finest_op = hierarchy.get_op(0);
+        let spmm_op = match finest_op.par_op() {
+            Some(par_op) => par_op as Arc<dyn LinOp<f64> + Send>,
+            None => finest_op.arc_mat(),
+        };
+        let mut multigrid = Multigrid::new(spmm_op, smoothers[0].clone());
+
+        for level in 1..level_count {
+            let op = hierarchy.get_op(level);
+            let spmm_op = match op.par_op() {
+                Some(par_op) => par_op as Arc<dyn LinOp<f64> + Send>,
+                None => finest_op.arc_mat(),
+            };
+            let smoother = smoothers[level].clone();
+            let r = hierarchy.get_restriction(level - 1);
+            let p = hierarchy.get_interpolation(level - 1);
+            multigrid.add_level(spmm_op, smoother, r, p);
+        }
+        multigrid.with_cycle_type(self.mu)
+    }
+}
+
+/// An abstract multigrid preconditioner. See `add_level` for manual construction details or use
+/// `MultigridConfig` as a builder for a standard AMG setup. Example `simple_geometric` shows the
+/// construction for a 1d finite difference for the negative second derivative and example `amg`
+/// shows usage for an SPD matrix system loaded from disk.
+#[derive(Debug, Clone)]
+pub struct Multigrid {
     operators: Vec<Arc<dyn LinOp<f64> + Send>>,
     smoothers: Vec<Arc<dyn BiPrecond<f64> + Send>>,
     interpolations: Vec<Arc<dyn LinOp<f64> + Send>>,
@@ -18,13 +132,16 @@ pub struct MultiGrid {
 
 const DEBUG: bool = false;
 
-impl MultiGrid {
-    pub fn new(
-        finest_op: Arc<dyn LinOp<f64> + Send>,
-        smoother: Arc<dyn BiPrecond<f64> + Send>,
-    ) -> Self {
+impl Multigrid {
+    /// Initializes a `Multigrid` with only a single level. `smoother` should (quickly) approximate
+    /// the inverse of `op`. When using this as a preconditioner for a solver such as conjugate
+    /// gradient, `op` here is the same operator as the one used in the system solver.
+    ///
+    /// Currently only symmetric multigrid is supported, so calling `apply_transpose` will simply
+    /// call `apply` but this is subject to change.
+    pub fn new(op: Arc<dyn LinOp<f64> + Send>, smoother: Arc<dyn BiPrecond<f64> + Send>) -> Self {
         Self {
-            operators: vec![finest_op],
+            operators: vec![op],
             smoothers: vec![smoother],
             interpolations: Vec::new(),
             restrictions: Vec::new(),
@@ -32,11 +149,26 @@ impl MultiGrid {
         }
     }
 
+    /// Calls the next level `mu` times at each level in the hierarchy. In the literature, `mu=1`
+    /// is called a V-cycle, `mu=2` a W-cycle, and `mu > 2` a mu-cycle. Algorithmic complexity
+    /// scales $O(\ell^\mu)$ where the grid has $\ell$ levels.
     pub fn with_cycle_type(mut self, mu: usize) -> Self {
         self.cycle_type = mu;
         self
     }
 
+    /// Adds a level to the hierarchy. Currently only symmetric multigrid is supported, so `r` and
+    /// `p` should be transpose operations of each other but this is subject to change.
+    /// Additionally, `r.ncols()` and `p.nrows()` must match the size of the last operator added
+    /// and `r.nrows()` and `p.ncols()` must match the size of the current `op` argument.
+    /// Traditionally these operators satisfy the 'Galerkin assembly': `op = r * previous_op * p`,
+    /// but this is not a strict requirement.
+    ///
+    /// `smoother` should quickly approximate the inverse of `op`. Although only symmetric
+    /// multigrid is supported does *NOT* mean that `smoother` must be symmetric. For example, the
+    /// `GaussSeidel` smoother is not a symmetric operator but the resulting multigrid is since
+    /// `smoother.apply` is called for forward smoothing (down) and `smoother.apply_transpose` is
+    /// called for backward smoothing (up).
     pub fn add_level(
         &mut self,
         op: Arc<dyn LinOp<f64> + Send>,
@@ -50,10 +182,12 @@ impl MultiGrid {
         self.restrictions.push(r);
     }
 
+    /// How many levels in the underlying grid / hierarchy
     pub fn levels(&self) -> usize {
         self.operators.len()
     }
 
+    /// See `with_cycle_type`
     pub fn cycle_type(&self) -> usize {
         self.cycle_type
     }
@@ -168,7 +302,7 @@ fn backward_smooth(
     }
 }
 
-impl LinOp<f64> for MultiGrid {
+impl LinOp<f64> for Multigrid {
     // TODO: low level API
     fn apply_scratch(&self, rhs_ncols: usize, par: Par) -> StackReq {
         let _rhs_ncols = rhs_ncols;
@@ -178,14 +312,14 @@ impl LinOp<f64> for MultiGrid {
 
     fn nrows(&self) -> usize {
         if self.operators.is_empty() {
-            unreachable!("Cannot determine dimension of partially uninitialized MultiGrid.");
+            unreachable!("Cannot determine dimension of partially uninitialized Multigrid.");
         }
         self.operators[0].nrows()
     }
 
     fn ncols(&self) -> usize {
         if self.operators.is_empty() {
-            unreachable!("Cannot determine dimension of partially uninitialized MultiGrid.");
+            unreachable!("Cannot determine dimension of partially uninitialized Multigrid.");
         }
         self.operators[0].ncols()
     }
@@ -208,7 +342,7 @@ impl LinOp<f64> for MultiGrid {
     }
 }
 
-impl BiLinOp<f64> for MultiGrid {
+impl BiLinOp<f64> for Multigrid {
     fn transpose_apply_scratch(&self, rhs_ncols: usize, par: Par) -> StackReq {
         // TODO : only symmetric multigrid
         self.apply_scratch(rhs_ncols, par)
@@ -238,5 +372,33 @@ impl BiLinOp<f64> for MultiGrid {
 }
 
 // TODO: auto impl are fine for now but custom would be better
-impl Precond<f64> for MultiGrid {}
-impl BiPrecond<f64> for MultiGrid {}
+impl Precond<f64> for Multigrid {}
+impl BiPrecond<f64> for Multigrid {}
+
+/*
+#[derive(Debug)]
+pub enum MultigridBuildError {
+    EmptyHierarchy,
+    CoarseSolveFailed(DenseLltError),
+}
+
+impl fmt::Display for MultigridBuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MultigridBuildError::EmptyHierarchy => write!(f, "hierarchy has no levels"),
+            MultigridBuildError::CoarseSolveFailed(_) => {
+                write!(f, "failed to factorize coarsest grid for multigrid")
+            }
+        }
+    }
+}
+
+impl Error for MultigridBuildError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            MultigridBuildError::CoarseSolveFailed(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+*/

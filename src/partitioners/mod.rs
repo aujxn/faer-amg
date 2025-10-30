@@ -1,24 +1,18 @@
-use std::{
-    collections::{BTreeSet, HashMap},
-    fmt,
-    sync::Arc,
-};
-
-use faer::{
-    sparse::{SparseRowMat, SparseRowMatRef},
-    MatRef,
-};
+use faer::{prelude::Reborrow, sparse::SparseRowMatRef, Mat, MatRef};
 use petgraph::{graph::NodeIndex, Graph, Undirected};
 use rayon::iter::{
     IntoParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator,
 };
+use std::{
+    collections::{BTreeSet, BinaryHeap, HashMap, VecDeque},
+    fmt::{self, Debug, Formatter},
+    sync::Arc,
+};
 
 pub mod modularity;
 pub mod multilevel;
-pub use modularity::ModularityPartitioner;
 
-// NOTE: for now no generics, will refactor to fully generic interfaces when API stabilizes...
-pub type PartitionerCallback = Arc<dyn Fn(usize, &ModularityPartitioner) + Send + Sync>;
+use crate::{core::SparseMatOp, partitioners::modularity::Partitioner};
 
 #[derive(Clone)]
 pub struct Partition {
@@ -215,10 +209,39 @@ impl fmt::Debug for Partition {
     }
 }
 
-pub struct PartitionBuilder<'a> {
-    pub mat: Arc<SparseRowMat<usize, f64>>,
-    pub block_size: usize,
-    pub near_null: MatRef<'a, f64>,
+#[derive(Clone)]
+pub struct PartitionerCallback {
+    f: Arc<dyn Fn(usize, &Partitioner) + Send + Sync>,
+    name: String,
+}
+
+impl Debug for PartitionerCallback {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PartitionerCallback")
+            .field("name", &self.name)
+            .finish()
+    }
+}
+
+impl PartitionerCallback {
+    pub fn new(f: Arc<dyn Fn(usize, &Partitioner) + Send + Sync>) -> Self {
+        Self {
+            f,
+            name: "Unnamed Callback".to_string(),
+        }
+    }
+
+    pub fn new_named(f: Arc<dyn Fn(usize, &Partitioner) + Send + Sync>, name: String) -> Self {
+        Self { f, name }
+    }
+
+    fn call(&self, iter: usize, partitioner: &Partitioner) {
+        self.f.as_ref()(iter, partitioner);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PartitionerConfig {
     pub coarsening_factor: f64,
     pub agg_size_penalty: f64,
     pub dist_penalty: f64,
@@ -226,52 +249,64 @@ pub struct PartitionBuilder<'a> {
     pub callback: Option<PartitionerCallback>,
 }
 
-impl<'a> PartitionBuilder<'a> {
-    pub fn new(
-        mat: Arc<SparseRowMat<usize, f64>>,
-        block_size: usize,
-        near_null: MatRef<'a, f64>,
-        coarsening_factor: f64,
-        agg_size_penalty: f64,
-        dist_penalty: f64,
-        max_improvement_iters: usize,
-    ) -> Self {
+impl Default for PartitionerConfig {
+    fn default() -> Self {
         Self {
-            mat,
-            block_size,
-            near_null,
-            coarsening_factor,
-            agg_size_penalty,
-            dist_penalty,
-            max_improvement_iters,
+            coarsening_factor: 8.0,
+            agg_size_penalty: 1e-1,
+            dist_penalty: 1e-6,
+            max_improvement_iters: 100,
             callback: None,
         }
     }
+}
 
-    pub fn create_partitioner(&self) -> ModularityPartitioner {
-        let mut strength =
-            AdjacencyList::new_strength_graph(self.mat.as_ref().as_ref(), self.near_null.as_ref());
-        if self.block_size > 1 {
-            let node_to_agg = (0..self.mat.nrows())
-                .map(|node_id| node_id / self.block_size)
+impl PartitionerConfig {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn build(
+        &self,
+        mat: SparseMatOp,
+        near_null: Arc<Mat<f64>>,
+        starting_partition: Option<Partition>,
+    ) -> Partitioner {
+        let mat_ref = mat.mat_ref();
+        let nn_ref = near_null.as_ref().as_ref();
+        let block_size = mat.block_size();
+        assert_eq!(mat_ref.nrows(), mat_ref.ncols());
+        assert_eq!(near_null.nrows(), mat_ref.nrows());
+        if let Some(part) = starting_partition.as_ref() {
+            part.validate();
+            assert_eq!(part.nnodes(), mat_ref.nrows());
+        }
+        let mut strength = AdjacencyList::new_strength_graph(mat_ref.rb(), nn_ref.rb());
+        if block_size > 1 {
+            let node_to_agg = (0..mat_ref.nrows())
+                .map(|node_id| node_id / block_size)
                 .collect();
             let block_reduce = Partition::from_node_to_agg(node_to_agg);
             strength.aggregate(&block_reduce);
             strength.filter_diag();
         }
-        ModularityPartitioner::new(
-            strength,
-            self.coarsening_factor,
-            self.agg_size_penalty,
-            self.dist_penalty,
-            self.callback.clone(),
-        )
+        let mut partitioner = Partitioner::new(strength, starting_partition, None, self.clone());
+        partitioner.initialize_partition();
+        partitioner.improve_partition();
+        partitioner
     }
 
-    pub fn build(&self) -> Partition {
-        let mut partitioner = self.create_partitioner();
-        partitioner.partition(self.coarsening_factor);
-        partitioner.improve(self.max_improvement_iters);
+    fn build_from_strength(
+        &self,
+        strength: AdjacencyList,
+        starting_partition: Option<Partition>,
+        node_weights: Option<Vec<usize>>,
+    ) -> Partitioner {
+        Partitioner::new(strength, starting_partition, node_weights, self.clone())
+    }
+
+    pub fn build_partition(&self, mat: SparseMatOp, near_null: Arc<Mat<f64>>) -> Partition {
+        let partitioner = self.build(mat, near_null, None);
         partitioner.into_partition()
     }
 }
@@ -354,6 +389,11 @@ impl AdjacencyList {
             .par_iter()
             .map(|agg| self.merge_agg(agg))
             .collect();
+        // NOTE: this is normalizing while including self loops. (and in the
+        // PartitionerConfig::build case these self loops are immediatelly thrown away.
+        // this might be bad
+        //
+        // Also I believe this is bugged...
         let max: f64 = neighborhoods
             .iter()
             .map(|(_, local_max_strength)| *local_max_strength)
@@ -459,35 +499,79 @@ impl AdjacencyList {
     }
 
     fn merge_agg(&self, agg: &BTreeSet<usize>) -> (Vec<(usize, f64)>, f64) {
-        // Bad complexity, use tournament tree...
-        let mut combined: Vec<(usize, f64)> = agg
-            .iter()
-            .copied()
-            .map(|node_id| self.nodes[node_id].iter().copied())
-            .flatten()
-            .collect();
-        combined.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        #[derive(Clone)]
+        struct HeapEntry {
+            local_id: usize,
+            neighbor: usize,
+            weight: f64,
+        }
 
-        let mut write_idx = 0;
-        let mut read_idx = 1;
-        while read_idx < combined.len() {
-            if combined[write_idx].0 == combined[read_idx].0 {
-                combined[write_idx].1 += combined[read_idx].1;
-                read_idx += 1;
-            } else {
-                write_idx += 1;
-                if write_idx < read_idx {
-                    combined[write_idx] = combined[read_idx];
-                }
-                read_idx += 1;
+        impl PartialOrd for HeapEntry {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(other.neighbor.cmp(&self.neighbor))
             }
         }
-        combined.truncate(write_idx + 1);
-        let local_max = *combined
+        impl Ord for HeapEntry {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                other.neighbor.cmp(&self.neighbor)
+            }
+        }
+        impl PartialEq for HeapEntry {
+            fn eq(&self, other: &Self) -> bool {
+                self.neighbor == other.neighbor
+            }
+        }
+        impl Eq for HeapEntry {}
+
+        let mut merge_queue: Vec<VecDeque<(usize, f64)>> = agg
             .iter()
-            .map(|(_, strength)| strength)
-            .max_by(|a, b| a.partial_cmp(b).unwrap())
-            .unwrap();
+            .copied()
+            .map(|node_id| self.nodes[node_id].iter().copied().collect())
+            .collect();
+        let mut min_heap: BinaryHeap<HeapEntry> = BinaryHeap::new();
+        for (local_id, neighborhood) in merge_queue.iter_mut().enumerate() {
+            let (neighbor, weight) = neighborhood
+                .pop_front()
+                .expect("empty neighborhood means graph is disconnected...");
+            let entry = HeapEntry {
+                local_id,
+                neighbor,
+                weight,
+            };
+            min_heap.push(entry);
+        }
+
+        let mut combined: Vec<(usize, f64)> = Vec::new();
+        loop {
+            match min_heap.pop() {
+                Some(entry) => {
+                    if let Some(last) = combined.last_mut() {
+                        if last.0 == entry.neighbor {
+                            last.1 += entry.weight;
+                        } else {
+                            combined.push((entry.neighbor, entry.weight));
+                        }
+                    } else {
+                        combined.push((entry.neighbor, entry.weight));
+                    }
+                    if let Some((neighbor, weight)) = merge_queue[entry.local_id].pop_front() {
+                        let next_entry = HeapEntry {
+                            local_id: entry.local_id,
+                            neighbor,
+                            weight,
+                        };
+                        min_heap.push(next_entry);
+                    }
+                }
+                None => break,
+            }
+        }
+
+        let local_max = combined
+            .iter()
+            .map(|(_, w)| *w)
+            .max_by(|a, b| a.partial_cmp(b).expect("bad float"))
+            .expect("empty neighborhood bad");
 
         (combined, local_max)
     }

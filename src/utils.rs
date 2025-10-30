@@ -1,4 +1,5 @@
 use std::{
+    fmt,
     fs::File,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
@@ -38,7 +39,7 @@ pub fn mats_are_equal(left: &SparseRowMat<usize, f64>, right: &SparseRowMat<usiz
     true
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MatrixStats {
     pub rows: usize,
     pub cols: usize,
@@ -146,6 +147,85 @@ pub fn matrix_stats(mat: SparseRowMatRef<usize, f64>) -> MatrixStats {
         rowsum_min,
         rowsum_max,
         rowsum_avg,
+    }
+}
+
+pub(crate) enum NdofsFormat {
+    Auto,
+    Rectangular,
+}
+
+pub(crate) fn write_matrix_stats_table(
+    f: &mut fmt::Formatter<'_>,
+    title: &str,
+    stats: &[MatrixStats],
+    ndofs_format: NdofsFormat,
+) -> fmt::Result {
+    if stats.is_empty() {
+        writeln!(f, "{}: <empty>", title)?;
+        return Ok(());
+    }
+
+    writeln!(f, "{title}")?;
+    writeln!(
+        f,
+        "{:>4}  {:>12}  {:>15}  {:>10}  {:>26}  {:>26}  {:>26}",
+        "lev", "ndofs", "nnz", "sparsity", "entries / row", "weights", "rowsums"
+    )?;
+    writeln!(
+        f,
+        "{:-<4}  {:-<12}  {:-<15}  {:-<10}  {:-<26}  {:-<26}  {:-<26}",
+        "", "", "", "", "", "", ""
+    )?;
+    writeln!(
+        f,
+        "{:>4}  {:>12}  {:>15}  {:>10}  {:>8} {:>8} {:>8}  {:>8} {:>8} {:>8}  {:>8} {:>8} {:>8}",
+        "", "", "", "", "min", "max", "avg", "min", "max", "avg", "min", "max", "avg"
+    )?;
+    writeln!(
+        f,
+        "{:-<4}  {:-<12}  {:-<15}  {:-<10}  {:-<8} {:-<8} {:-<8}  {:-<8} {:-<8} {:-<8}  {:-<8} {:-<8} {:-<8}",
+        "", "", "", "", "", "", "", "", "", "", "", "", ""
+    )?;
+
+    for (level, stat) in stats.iter().enumerate() {
+        let ndofs = match ndofs_format {
+            NdofsFormat::Rectangular => format!("{}x{}", stat.rows, stat.cols),
+            NdofsFormat::Auto => {
+                if stat.rows == stat.cols {
+                    format!("{}", stat.rows)
+                } else {
+                    format!("{}x{}", stat.rows, stat.cols)
+                }
+            }
+        };
+
+        writeln!(
+            f,
+            "{:>4}  {:>12}  {:>15}  {:>10.2}  {:>8} {:>8} {:>8.2}  {:>8.2} {:>8.2} {:>8.2}  {:>8.2} {:>8.2} {:>8.2}",
+            level,
+            ndofs,
+            stat.nnz,
+            stat.sparsity,
+            stat.entries_min,
+            stat.entries_max,
+            stat.entries_avg,
+            stat.weight_min,
+            stat.weight_max,
+            stat.weight_avg,
+            stat.rowsum_min,
+            stat.rowsum_max,
+            stat.rowsum_avg
+        )?;
+    }
+
+    Ok(())
+}
+
+impl fmt::Debug for MatrixStats {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_matrix_stats_table(f, "Matrix info:", &[self.clone()], NdofsFormat::Rectangular)?;
+        Ok(())
     }
 }
 

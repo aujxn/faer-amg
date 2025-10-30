@@ -109,7 +109,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("data")
-            .join("anisotropy")
+            //.join("anisotropy")
+            .join("isotropic")
             .join("2d")
             .join(&coef_dir);
 
