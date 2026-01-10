@@ -239,7 +239,7 @@ impl BiLinOp<f64> for SparseCholeskySolve {
         par: Par,
         stack: &mut MemStack,
     ) {
-        self.apply(out, rhs, par, stack);
+        self.conj_apply(out, rhs, par, stack);
     }
 }
 

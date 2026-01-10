@@ -1,11 +1,17 @@
+use std::collections::BTreeSet;
+
 use faer::{
+    mat::AsMatMut,
+    prelude::{Reborrow, ReborrowMut, Solve},
     sparse::{ops::add_assign, SparseRowMat, SparseRowMatRef, Triplet},
-    Col, Mat, MatRef,
+    Col, Mat, MatMut, MatRef,
 };
-use log::info;
+use log::{info, warn};
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
 use crate::{
     partitioners::Partition,
+    preconditioners::block_smoothers::{diagonally_compensate, diagonally_compensate_vector},
     utils::{matrix_stats, MatrixStats},
 };
 
@@ -84,28 +90,19 @@ pub fn smoothed_aggregation(
         let s = svd.S();
         let r = svd.V();
 
-        let d0 = s[0];
-        for d in s.column_vector().iter() {
-            assert!(
-                d / d0 > 1e-6,
+        /*
+        let s_first = s[0];
+        let s_last = s[k - 1];
+        if s_last / s_first < 1e-6 {
+            warn!(
                 "Local basis in linearly dependent...\n\tsingular values: {:?}",
                 s
             );
         }
+        */
         let r = s * r.transpose();
 
         coarse_near_null.subrows_mut(coarse_idx * k, k).copy_from(r);
-        /*
-        for (i, r_row) in r.row_iter().enumerate() {
-            for (dest, src) in coarse_near_null
-                .row_mut(coarse_idx * k + i)
-                .iter_mut()
-                .zip(r_row.iter())
-            {
-                *dest = *src;
-            }
-        }
-        */
 
         for (local_i, fine_i) in agg.iter().copied().enumerate() {
             let col_start = coarse_idx * k;
@@ -133,6 +130,10 @@ pub fn smoothed_aggregation(
     } else {
         p = block_jacobi(fine_mat, block_size, p.as_ref());
     };
+    /*
+    let m_inv = csr_block_smoother(partition, fine_mat.rb(), block_size);
+    p = smooth_p(fine_mat, m_inv.as_ref(), p.as_ref());
+    */
 
     let r = p
         .transpose()
@@ -140,6 +141,93 @@ pub fn smoothed_aggregation(
         .expect("failed to transpose SA interp to form restriction");
     let mat_coarse = &r * &(fine_mat * &p);
     (coarse_near_null, r, p, mat_coarse)
+}
+
+fn csr_block_smoother(
+    partition: &Partition,
+    mat: SparseRowMatRef<usize, f64>,
+    vdim: usize,
+) -> SparseRowMat<usize, f64> {
+    let n_aggs = partition.naggs();
+    let n = mat.nrows();
+    let mut permutation: Vec<usize> = partition
+        .aggregates()
+        .iter()
+        .map(|agg| {
+            agg.iter()
+                .map(|block_idx| {
+                    let start = block_idx * vdim;
+                    let end = start + vdim;
+                    (start..end).collect::<Vec<usize>>()
+                })
+                .flatten()
+                .collect::<Vec<usize>>()
+        })
+        .flatten()
+        .collect();
+
+    let diag_block_inv: Vec<Mat<f64>> = partition
+        .aggregates()
+        .par_iter()
+        .map(|agg| {
+            let local = if vdim == 1 {
+                diagonally_compensate(agg, mat.rb())
+            } else {
+                diagonally_compensate_vector(agg, mat.rb(), vdim)
+            };
+            local
+                .to_dense()
+                .self_adjoint_eigen(faer::Side::Upper)
+                .unwrap()
+                .pseudoinverse()
+        })
+        .collect();
+
+    let mut triplets = Vec::new();
+    let mut start_idx = 0;
+    for block in diag_block_inv {
+        let local_dim = block.nrows();
+        for local_i in 0..local_dim {
+            for local_j in 0..local_dim {
+                let val = block[(local_i, local_j)];
+                let i = start_idx + local_i;
+                let j = start_idx + local_j;
+                let row = permutation[i];
+                let col = permutation[j];
+                triplets.push(Triplet { row, col, val });
+            }
+        }
+        start_idx += local_dim;
+    }
+    SparseRowMat::try_new_from_triplets(n, n, &triplets).unwrap()
+}
+
+pub fn local_diag_inv(
+    agg: &BTreeSet<usize>,
+    mat: SparseRowMatRef<usize, f64>,
+    vdim: usize,
+    rhs: MatMut<f64>,
+) {
+    let mut rhs = rhs;
+    for (local_block_idx, global_block_idx) in agg.iter().enumerate() {
+        let mut block_inv = Mat::zeros(vdim, vdim);
+        //let global_start = global_block_idx * vdim;
+        let local_start = local_block_idx * vdim;
+        for offset_i in 0..vdim {
+            //let global_i = global_start + offset_i;
+            for offset_j in 0..vdim {
+                //let global_j = global_start + offset_j;
+                //let mat_ij = mat.get(global_i, global_j).unwrap_or(&0.0);
+                let mat_ij = mat
+                    .get(local_start + offset_i, local_start + offset_j)
+                    .unwrap_or(&0.0);
+                block_inv[(offset_i, offset_j)] = *mat_ij;
+            }
+        }
+        let sub_rhs = rhs.rb_mut().subrows_mut(local_start, vdim);
+        block_inv.partial_piv_lu().solve_in_place(sub_rhs);
+    }
+    rhs *= 0.5;
 }
 
 pub fn smooth_interpolation(
@@ -241,6 +329,18 @@ pub fn block_jacobi(
     let mut smoothed = d_inv * ap;
     //let d_inv_a = d_inv * mat;
     //let mut smoothed = d_inv_a * p;
+    add_assign(smoothed.transpose_mut(), p.transpose());
+    smoothed
+}
+
+pub fn smooth_p(
+    mat: SparseRowMatRef<usize, f64>,
+    m_inv: SparseRowMatRef<usize, f64>,
+    p: SparseRowMatRef<usize, f64>,
+) -> SparseRowMat<usize, f64> {
+    let mut ap = mat * p;
+    ap *= -1.0;
+    let mut smoothed = m_inv * ap;
     add_assign(smoothed.transpose_mut(), p.transpose());
     smoothed
 }

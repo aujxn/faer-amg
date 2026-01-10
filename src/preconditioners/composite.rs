@@ -24,14 +24,14 @@ impl LinOp<f64> for Composite {
     }
 
     fn apply_scratch(&self, rhs_ncols: usize, par: Par) -> StackReq {
-        StackReq::any_of(
-            &self
-                .components
+        let mut scratch = vec![self.mat.apply_scratch(rhs_ncols, par)];
+        scratch.extend(
+            self.components
                 .iter()
-                .map(|comp| comp.apply_scratch(rhs_ncols, par))
-                .collect::<Vec<StackReq>>(),
-        )
-        .and(temp_mat_scratch::<f64>(self.mat.nrows(), rhs_ncols))
+                .map(|comp| comp.apply_in_place_scratch(rhs_ncols, par)),
+        );
+
+        StackReq::any_of(&scratch).and(temp_mat_scratch::<f64>(self.mat.nrows(), rhs_ncols))
     }
 
     fn apply(&self, out: MatMut<f64>, rhs: MatRef<f64>, par: Par, stack: &mut MemStack) {
@@ -42,6 +42,8 @@ impl LinOp<f64> for Composite {
         self.apply(out, rhs, par, stack);
     }
 }
+
+impl Precond<f64> for Composite {}
 
 impl Composite {
     pub fn new(

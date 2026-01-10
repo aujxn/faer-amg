@@ -1,4 +1,4 @@
-use crate::par_spmv::ParSpmmOp;
+use crate::par_spmm::ParSpmmOp;
 use faer::{
     matrix_free::LinOp,
     sparse::{SparseRowMat, SparseRowMatRef},
@@ -83,6 +83,12 @@ impl SparseMatOp {
 
     pub fn par_op(&self) -> Option<Arc<ParSpmmOp>> {
         self.par_op.clone()
+    }
+
+    pub fn dyn_op(&self) -> Arc<dyn LinOp<f64> + Send> {
+        self.par_op()
+            .map(|op| op as Arc<dyn LinOp<f64> + Send>)
+            .unwrap_or(self.arc_mat())
     }
 
     pub fn block_size(&self) -> usize {

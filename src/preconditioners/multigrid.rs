@@ -1,14 +1,22 @@
 use crate::{
     hierarchy::Hierarchy,
-    partitioners::{Partition, PartitionerConfig},
-    preconditioners::{block_smoothers::BlockSmootherConfig, coarse_solvers::CoarseSolverKind},
+    par_spmm::{ParSpmmOp, PAR_BLOCK_SIZE},
+    partitioners::{multilevel::MultilevelPartitionerConfig, Partition, PartitionerConfig},
+    preconditioners::{
+        block_smoothers::BlockSmootherConfig, coarse_solvers::CoarseSolverKind, smoothers::new_l1,
+    },
 };
 use faer::{
-    dyn_stack::{MemStack, StackReq},
+    dyn_stack::{MemBuffer, MemStack, StackReq},
+    get_global_parallelism,
+    linalg::temp_mat_scratch,
     matrix_free::{BiLinOp, BiPrecond, LinOp, Precond},
     reborrow::*,
+    stats::{prelude::StandardNormal, CwiseMatDistribution, DistributionExt},
+    traits::math_utils::max,
     Mat, MatMut, MatRef, Par,
 };
+use rand::rng;
 use std::sync::Arc;
 
 /// This builder helps construct multigrid preconditioners for basic configurations. The number of
@@ -54,28 +62,24 @@ impl MultigridConfig {
         let level_count = hierarchy.levels();
         let mut smoothers: Vec<Arc<dyn BiPrecond<f64> + Send>> = Vec::with_capacity(level_count);
 
-        /*
-        let fine_near_null = hierarchy.get_near_null(0);
-        let fine_op = hierarchy.get_op(0);
         let mut partition_config = hierarchy.get_config().partitioner_config.clone();
-        partition_config.coarsening_factor = 128.0;
-        partition_config.max_improvement_iters = 1000;
-        //partition_config.agg_size_penalty = 0.0;
-        let mut partitioner = partition_config.build(fine_op, fine_near_null, None);
-        let mut smoother_partitions = vec![Arc::new(partitioner.get_partition().clone())];
-        for part in hierarchy.partitions() {
-            partitioner.rebase(part.as_ref().clone());
-            smoother_partitions.push(Arc::new(partitioner.get_partition().clone()));
-        }
-        */
-        let mut partition_config = hierarchy.get_config().partitioner_config.clone();
-        partition_config.coarsening_factor = 128.0;
-        partition_config.max_improvement_iters = 300;
+        let n_levels = 4;
+        let cf: f64 = 128.;
+        partition_config.coarsening_factor = cf.powf(1. / n_levels as f64);
+        partition_config.max_improvement_iters = 100;
+        let ml_partitioner_config = MultilevelPartitionerConfig {
+            partitioner_configs: vec![partition_config; n_levels],
+        };
         let mut smoother_partitions = vec![];
         for level in 0..(level_count - 1) {
             let op = hierarchy.get_op(level);
             let near_null = hierarchy.get_near_null(level);
-            let partition = partition_config.build_partition(op, near_null);
+            //let partition = partition_config.build_partition(op, near_null);
+            let partitions = ml_partitioner_config.build_hierarchy(op.clone(), near_null);
+            let mut partition = Partition::singleton(op.mat_ref().nrows() / op.block_size());
+            for p in partitions {
+                partition.compose(&p);
+            }
             smoother_partitions.push(Arc::new(partition));
         }
 
@@ -89,11 +93,18 @@ impl MultigridConfig {
                     let op = hierarchy.get_op(level);
                     Arc::new(
                         self.smoother_config
-                            .build(op, smoother_partitions[level].clone()),
+                            .build_from_partition(op, smoother_partitions[level].clone()),
                     )
                 };
             smoothers.push(smoother);
         }
+        /*
+        for level in 0..level_count {
+            let smoother: Arc<dyn BiPrecond<f64> + Send> =
+                Arc::new(new_l1(hierarchy.get_mat_ref(level)));
+            smoothers.push(smoother);
+        }
+        */
 
         let finest_op = hierarchy.get_op(0);
         let spmm_op = match finest_op.par_op() {
@@ -102,6 +113,8 @@ impl MultigridConfig {
         };
         let mut multigrid = Multigrid::new(spmm_op, smoothers[0].clone());
 
+        let par = get_global_parallelism();
+        let n_threads = par.degree();
         for level in 1..level_count {
             let op = hierarchy.get_op(level);
             let spmm_op = match op.par_op() {
@@ -111,7 +124,14 @@ impl MultigridConfig {
             let smoother = smoothers[level].clone();
             let r = hierarchy.get_restriction(level - 1);
             let p = hierarchy.get_interpolation(level - 1);
-            multigrid.add_level(spmm_op, smoother, r, p);
+            let par_threshold = PAR_BLOCK_SIZE * n_threads * 4;
+            if r.nrows() > par_threshold && r.ncols() > par_threshold {
+                let r = Arc::new(ParSpmmOp::new(r.as_ref().as_ref(), par));
+                let p = Arc::new(ParSpmmOp::new(p.as_ref().as_ref(), par));
+                multigrid.add_level(spmm_op, smoother, r, p);
+            } else {
+                multigrid.add_level(spmm_op, smoother, r, p);
+            }
         }
         multigrid.with_cycle_type(self.mu)
     }
@@ -305,9 +325,30 @@ fn backward_smooth(
 impl LinOp<f64> for Multigrid {
     // TODO: low level API
     fn apply_scratch(&self, rhs_ncols: usize, par: Par) -> StackReq {
-        let _rhs_ncols = rhs_ncols;
-        let _par = par;
-        StackReq::EMPTY
+        let mg_reqs: Vec<StackReq> = self
+            .operators
+            .iter()
+            .map(|op| vec![temp_mat_scratch::<f64>(op.nrows(), rhs_ncols); 3])
+            .flatten()
+            .collect();
+        let mg_req = StackReq::all_of(&mg_reqs);
+
+        let transfer_reqs: Vec<StackReq> = self
+            .interpolations
+            .iter()
+            .chain(self.restrictions.iter())
+            .map(|op| op.apply_scratch(rhs_ncols, par))
+            .collect();
+        let transfer_req = StackReq::any_of(&transfer_reqs);
+
+        let smoother_reqs: Vec<StackReq> = self
+            .smoothers
+            .iter()
+            .map(|op| op.apply_in_place_scratch(rhs_ncols, par))
+            .collect();
+        let smoother_req = StackReq::any_of(&smoother_reqs);
+
+        mg_req.and(StackReq::any_of(&[transfer_req, smoother_req]))
     }
 
     fn nrows(&self) -> usize {
@@ -374,6 +415,68 @@ impl BiLinOp<f64> for Multigrid {
 // TODO: auto impl are fine for now but custom would be better
 impl Precond<f64> for Multigrid {}
 impl BiPrecond<f64> for Multigrid {}
+
+pub fn symmetry_test(bilinear_op: Arc<dyn BiLinOp<f64> + Send>) {
+    let n = bilinear_op.nrows();
+    let test_dim = 20;
+    let rng = &mut rng();
+    let par = get_global_parallelism();
+
+    let sampler = CwiseMatDistribution {
+        nrows: n,
+        ncols: test_dim,
+        dist: StandardNormal,
+    };
+    let u = sampler.rand::<Mat<f64>>(rng);
+    let v = sampler.rand::<Mat<f64>>(rng);
+
+    let mut work: Mat<f64> = Mat::zeros(n, test_dim);
+    //let mut utav: Mat<f64> = Mat::zeros(test_dim, test_dim);
+    //let mut vtau: Mat<f64> = Mat::zeros(test_dim, test_dim);
+
+    let stack_req = StackReq::any_of(&[
+        bilinear_op.apply_scratch(test_dim, par),
+        bilinear_op.transpose_apply_scratch(test_dim, par),
+    ]);
+    let mut buf = MemBuffer::new(stack_req);
+    let stack = MemStack::new(&mut buf);
+    bilinear_op.apply(work.as_mut(), v.as_ref(), par, stack);
+    let utav = u.transpose() * work.as_ref();
+
+    bilinear_op.transpose_apply(work.as_mut(), u.as_ref(), par, stack);
+    let vtatu = v.transpose() * work.as_ref();
+    let maybe_utav = vtatu.transpose();
+
+    let diff = utav.as_ref() - maybe_utav;
+
+    let mut max_err = 0.0;
+    let mut max_rel_err = 0.0;
+    for i in 0..test_dim {
+        for j in 0..test_dim {
+            /*
+            print!(
+                "{:.3e}-{:.3e}={:.3e}  ",
+                utav[(i, j)],
+                maybe_utav[(i, j)],
+                diff[(i, j)]
+            );
+            */
+            let err = diff[(i, j)].abs();
+            let rel_err = err / max(&utav[(i, j)], &maybe_utav[(i, j)]);
+            if err > max_err {
+                max_err = err;
+            }
+            if rel_err > max_rel_err {
+                max_rel_err = rel_err;
+            }
+        }
+        //println!();
+    }
+    println!(
+        "max error (abs , rel): {:.2e} , {:.2e}",
+        max_err, max_rel_err
+    );
+}
 
 /*
 #[derive(Debug)]

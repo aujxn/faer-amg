@@ -10,10 +10,10 @@ use log::info;
 use std::{fmt, sync::Arc};
 
 use crate::{
-    adaptivity::smooth_vector_rand_svd,
+    adaptivity::{find_near_null, smooth_vector_rand_svd},
     core::SparseMatOp,
     interpolation::smoothed_aggregation,
-    par_spmv::ParSpmmOp,
+    par_spmm::ParSpmmOp,
     partitioners::{
         multilevel::MultilevelPartitionerConfig, Partition, PartitionStats, PartitionerConfig,
     },
@@ -45,7 +45,7 @@ impl HierarchyConfig {
 
     pub fn build(&self, base_matrix: SparseMatOp, near_null: Arc<Mat<f64>>) -> Hierarchy {
         let mut hierarchy = Hierarchy::new(base_matrix, near_null, self.clone());
-        hierarchy.coarsen2();
+        hierarchy.coarsen();
         hierarchy
     }
 }
@@ -161,12 +161,7 @@ impl fmt::Debug for Hierarchy {
 impl Hierarchy {
     fn new(fine_op: SparseMatOp, fine_near_null: Arc<Mat<f64>>, config: HierarchyConfig) -> Self {
         let n_candidates = config.interp_candidate_dim;
-        let mut candidates = Mat::ones(fine_near_null.nrows(), n_candidates);
-        let candidates_to_copy = fine_near_null.subcols(0, n_candidates - 1);
-        candidates
-            .subcols_mut(1, n_candidates - 1)
-            .copy_from(candidates_to_copy);
-        candidates = candidates.qr().compute_thin_Q();
+        let candidates = fine_near_null.subcols(0, n_candidates).to_owned();
         Self {
             operators: vec![fine_op],
             restrictions: Vec::new(),
@@ -178,6 +173,7 @@ impl Hierarchy {
         }
     }
 
+    /*
     fn coarsen2(&mut self) {
         let candidate_dim = self.config.interp_candidate_dim as f64;
         let coarsest_dim = self.config.coarsest_dim;
@@ -246,6 +242,7 @@ impl Hierarchy {
             level += 1;
         }
     }
+    */
 
     fn coarsen(&mut self) {
         let candidate_dim = self.config.interp_candidate_dim as f64;
@@ -274,32 +271,23 @@ impl Hierarchy {
 
         let partitions = ml_partitioner_config.build_hierarchy(op, near_null.clone());
 
-        let candidates = self.config.interp_candidate_dim;
-        let mut interp_near_null = Mat::ones(near_null.nrows(), candidates);
-        let candidates_to_copy = near_null.subcols(0, candidates - 1);
-        interp_near_null
-            .subcols_mut(1, candidates - 1)
-            .copy_from(candidates_to_copy);
-        let mut interp_near_null = Arc::new(interp_near_null);
-
+        let n_candidates = self.config.interp_candidate_dim;
         let par = get_global_parallelism();
 
-        for partition in partitions.into_iter() {
+        for (level, partition) in partitions.into_iter().enumerate() {
             let fine_mat = self.current_op();
+            let candidates = self.candidates.last().unwrap().clone();
             let (mut coarse_near_null, restriction_mat, interpolation_mat, coarse_mat) =
                 smoothed_aggregation(
                     fine_mat.mat_ref(),
                     &partition,
                     fine_mat.block_size(),
-                    interp_near_null.as_ref().as_ref(),
+                    candidates.as_ref().as_ref(),
                 );
 
-            let coarse_op = SparseMatOp::new(coarse_mat, candidates, par);
+            let coarse_op = SparseMatOp::new(coarse_mat, n_candidates, par);
             let l1_diag = Arc::new(new_l1(coarse_op.mat_ref()));
-            let dyn_op: Arc<dyn LinOp<f64> + Send> = coarse_op
-                .par_op()
-                .map(|op| op as Arc<dyn LinOp<f64> + Send>)
-                .unwrap_or(coarse_op.arc_mat());
+            let dyn_op = coarse_op.dyn_op();
             let stationary = StationaryIteration::new(dyn_op, l1_diag, 3);
             let stack_req = stationary
                 .apply_in_place_scratch(coarse_near_null.ncols(), get_global_parallelism());
@@ -311,12 +299,22 @@ impl Hierarchy {
                 stack,
             );
 
-            interp_near_null = Arc::new(coarse_near_null);
+            let coarse_candidates = Arc::new(coarse_near_null);
             let p = Arc::new(interpolation_mat);
             let r = Arc::new(restriction_mat);
             let partition = Arc::new(partition);
-
-            self.add_level(coarse_op, partition, interp_near_null.clone(), p, r);
+            //let near_null = smooth_vector_rand_svd(coarse_op.clone(), 15, 128);
+            let max_dim = coarse_op.mat_ref().nrows().max(1);
+            let near_null_dim = 128.min(max_dim);
+            let smoother_block = 64.min(max_dim);
+            let near_null = find_near_null(coarse_op.clone(), 50, near_null_dim, smoother_block);
+            self.near_nulls.push(Arc::new(near_null));
+            self.add_level(coarse_op, partition, coarse_candidates, p, r);
+            info!(
+                "Created coarse op at level {}. Hierarchy:\n{:?}",
+                level + 1,
+                &self
+            );
         }
 
         /*

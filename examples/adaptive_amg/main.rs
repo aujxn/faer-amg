@@ -5,7 +5,6 @@ use env_logger;
 use faer::{
     dyn_stack::{MemBuffer, MemStack, StackReq},
     get_global_parallelism,
-    linalg::matmul::dot::inner_prod,
     matrix_free::{
         conjugate_gradient::{
             conjugate_gradient, conjugate_gradient_scratch, CgError, CgInfo, CgParams,
@@ -21,16 +20,12 @@ use faer::{
     Col, Mat, Par,
 };
 use faer_amg::{
-    adaptivity::{find_near_null, smooth_vector_rand_svd, AdaptiveConfig, ErrorPropogator},
+    adaptivity::{AdaptiveConfig, ErrorPropogator},
     core::SparseMatOp,
     decompositions::rand_svd::rand_svd,
     hierarchy::HierarchyConfig,
     partitioners::{modularity::Partitioner, PartitionerCallback, PartitionerConfig},
-    preconditioners::{
-        block_smoothers::BlockSmootherConfig,
-        multigrid::{symmetry_test, MultigridConfig},
-        smoothers::StationaryIteration,
-    },
+    preconditioners::{block_smoothers::BlockSmootherConfig, multigrid::MultigridConfig},
     utils::load_mfem_linear_system,
 };
 use log::{info, warn, LevelFilter};
@@ -48,10 +43,6 @@ struct Cli {
     /// Use the blend_x variant of the coefficient data
     #[arg(long = "blend_x")]
     blend_x: bool,
-
-    /// Use 0 vector for starting CG guess (otherwise random)
-    #[arg(long, default_value_t = false)]
-    zero_guess: bool,
 
     /// Number of refinements (the number after 'h' in 'h4p1')
     #[arg(long, default_value_t = 4)]
@@ -96,6 +87,10 @@ struct Cli {
     /// Stop coarsening once the operator dimension falls at or below this size
     #[arg(long, default_value_t = 1000)]
     coarsest_dim: usize,
+
+    /// Maximum number of components to create for composite preconditioner
+    #[arg(long, default_value_t = 3)]
+    max_components: usize,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
@@ -179,21 +174,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         partitioner_config,
         interp_candidate_dim: cli.interp_near_null_dim,
     };
-    let nn = find_near_null(
-        base_mat.clone(),
-        cli.smoothing_iters,
-        cli.coarsening_near_null_dim - 1,
-        cli.block_smoother_size,
-    );
-    let mut nn_with_constant = Mat::ones(nn.nrows(), cli.coarsening_near_null_dim);
-    nn_with_constant
-        .subcols_mut(1, cli.coarsening_near_null_dim - 1)
-        .copy_from(nn);
-    let nn_basis = nn_with_constant.qr().compute_thin_Q();
-    let near_null = Arc::new(nn_basis);
-
-    let hierarchy = hierarchy_config.build(base_mat.clone(), near_null);
-    info!("{:?}", hierarchy);
 
     let smoother_partitioner_config = PartitionerConfig {
         coarsening_factor: cli.block_smoother_size as f64,
@@ -209,12 +189,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         smoother_config,
         ..Default::default()
     };
-    let multigrid = multigrid_config.build(hierarchy);
+
+    let adaptive_config = AdaptiveConfig {
+        hierarchy_config,
+        multigrid_config,
+        test_iters: cli.smoothing_iters,
+        max_components: cli.max_components,
+        coarsening_near_null_dim: cli.coarsening_near_null_dim,
+        ..Default::default()
+    };
+    let multigrid = adaptive_config.build(base_mat.clone());
 
     let par_op = base_mat.par_op().unwrap() as Arc<dyn LinOp<f64> + Send>;
     let arc_pc = Arc::new(multigrid);
-    println!("Preconditioner symmetry test:");
-    symmetry_test(arc_pc.clone());
     let rhs_test_vecs = 10;
 
     let iterations = 5;
@@ -222,42 +209,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         op: par_op.clone(),
         pc: arc_pc.clone(),
     };
-    println!("Error prop symmetry test:");
-    symmetry_test(Arc::new(error_prop.clone()));
-    let (_u, s, v) = rand_svd(error_prop.clone(), rhs_test_vecs, 5, iterations);
-
-    let mut mem = MemBuffer::new(StackReq::any_of(&[
-        par_op.apply_scratch(rhs_test_vecs, par),
-        error_prop.apply_scratch(rhs_test_vecs, par),
-    ]));
-    let stack = MemStack::new(&mut mem);
-    let mut av = Mat::zeros(v.nrows(), v.ncols());
-    let mut ev = Mat::zeros(v.nrows(), v.ncols());
-    let mut a_ev = Mat::zeros(v.nrows(), v.ncols());
-    par_op.apply(av.as_mut(), v.as_ref(), par, stack);
-    error_prop.apply(ev.as_mut(), v.as_ref(), par, stack);
-    par_op.apply(a_ev.as_mut(), ev.as_ref(), par, stack);
-    let a_norms = Col::from_iter((0..rhs_test_vecs).map(|i| {
-        let vtav = inner_prod(
-            v.col(i).transpose(),
-            faer::Conj::No,
-            av.col(i),
-            faer::Conj::No,
-        );
-        let vt_a_ev = inner_prod(
-            v.col(i).transpose(),
-            faer::Conj::No,
-            a_ev.col(i),
-            faer::Conj::No,
-        );
-        vt_a_ev / vtav
-    }));
-    let convergence_factors: String = a_norms.iter().map(|norm| format!("{:.2} ", norm)).collect();
-    info!("Column A norms of E v: {}", convergence_factors);
+    let (_u, s, _v) = rand_svd(error_prop, rhs_test_vecs, 5, iterations);
     let convergence_factors: String = s
         .into_column_vector()
         .iter()
-        .map(|singular_value| format!("{:.2} ", singular_value))
+        .map(|singular_value| format!("{:.2} ", singular_value.powf((iterations as f64).recip())))
         .collect();
     info!(
         "near-null smoothing convergence factors: {}",
@@ -269,7 +225,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         cli.tolerance, cli.max_iters
     );
     let rhs_vec: Col<f64> = rhs_full.col(0).to_owned();
-    //let mut dst: Col<f64> = Col::zeros(matrix.nrows());
 
     let rng = &mut StdRng::seed_from_u64(42);
     let mut dst = CwiseColDistribution {

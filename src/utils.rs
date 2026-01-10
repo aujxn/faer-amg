@@ -311,9 +311,12 @@ pub fn load_mfem_linear_system<P: AsRef<Path>, S: AsRef<Path>>(
     let rhs = build_mat_from_rows(&rhs_data, &selection)?;
     let coords = build_mat_from_rows(&coords_data, &selection)?;
 
+    /*
     let mesh_geometry = find_associated_vtk(&base_path)?
         .map(|path| load_triangle_mesh_data(&path).map(|mesh| mesh.to_mesh_geometry()))
         .transpose()?;
+    */
+    let mesh_geometry = None;
 
     Ok(MfemLinearSystem {
         matrix,

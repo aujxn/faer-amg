@@ -3,6 +3,7 @@ use std::sync::Arc;
 use faer::{
     diag::Diag,
     dyn_stack::{MemStack, StackReq},
+    linalg::temp_mat_scratch,
     mat::AsMatRef,
     matrix_free::{BiLinOp, BiPrecond, LinOp, Precond},
     prelude::{Reborrow, ReborrowMut},
@@ -94,14 +95,39 @@ impl StationaryIteration {
     ) -> Self {
         Self { mat, prec, iters }
     }
+
+    pub fn set_op(&mut self, op: Arc<dyn LinOp<f64> + Send>) {
+        self.mat = op;
+    }
+
+    pub fn get_op(&self) -> Arc<dyn LinOp<f64> + Send> {
+        self.mat.clone()
+    }
+
+    pub fn set_pc(&mut self, pc: Arc<dyn LinOp<f64> + Send>) {
+        self.prec = pc;
+    }
+
+    pub fn get_pc(&self) -> Arc<dyn LinOp<f64> + Send> {
+        self.prec.clone()
+    }
+
+    pub fn set_iters(&mut self, iters: usize) {
+        self.iters = iters;
+    }
+
+    pub fn get_iters(&self) -> usize {
+        self.iters
+    }
 }
 
 impl LinOp<f64> for StationaryIteration {
-    // TODO: low level API
     fn apply_scratch(&self, rhs_ncols: usize, par: Par) -> StackReq {
-        let _par = par;
-        //StackReq::EMPTY
-        StackReq::new_aligned::<f64>(self.nrows() * 3 * rhs_ncols, 64)
+        let req = StackReq::all_of(&[temp_mat_scratch::<f64>(self.nrows(), rhs_ncols); 3]);
+        req.and(StackReq::any_of(&[
+            self.mat.apply_scratch(rhs_ncols, par),
+            self.prec.apply_scratch(rhs_ncols, par),
+        ]))
     }
 
     fn nrows(&self) -> usize {
@@ -114,17 +140,17 @@ impl LinOp<f64> for StationaryIteration {
 
     fn apply(&self, out: MatMut<'_, f64>, rhs: MatRef<'_, f64>, par: Par, stack: &mut MemStack) {
         let mut out = out;
-        let mut work1 = Mat::zeros(out.nrows(), out.ncols());
-        let mut work2 = Mat::zeros(out.nrows(), out.ncols());
-        work1.copy_from(rhs);
-        for _ in 0..self.iters {
-            self.mat
-                .apply(work2.rb_mut(), work1.as_mat_ref(), par, stack);
-            self.prec
-                .apply(out.rb_mut(), work2.as_mat_ref(), par, stack);
-            work1 -= out.rb();
+        let mut x = Mat::zeros(out.nrows(), out.ncols());
+        let mut r = Mat::zeros(out.nrows(), out.ncols());
+        // initial residual is rhs
+        self.prec.apply(x.rb_mut(), rhs, par, stack);
+        for _ in 1..self.iters {
+            self.mat.apply(r.rb_mut(), x.as_ref(), par, stack);
+            r = x.as_ref() - r;
+            self.prec.apply(out.rb_mut(), r.as_ref(), par, stack);
+            x += out.rb();
         }
-        out.copy_from(work1);
+        out.copy_from(x);
     }
 
     fn conj_apply(
