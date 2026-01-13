@@ -40,10 +40,6 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = CoefType::Spiral)]
     coef: CoefType,
 
-    /// Use the blend_x variant of the coefficient data
-    #[arg(long = "blend_x")]
-    blend_x: bool,
-
     /// Number of refinements (the number after 'h' in 'h4p1')
     #[arg(long, default_value_t = 4)]
     refinements: u32,
@@ -95,6 +91,7 @@ struct Cli {
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
 enum CoefType {
+    Brandt,
     Constant,
     #[value(alias = "block_random")]
     BlockRandom,
@@ -287,6 +284,7 @@ fn report(result: Result<CgInfo<f64>, CgError<f64>>) -> Result<(), Box<dyn Error
 
 fn system_path(cli: &Cli) -> (PathBuf, String) {
     let base_coef_dir = match cli.coef {
+        CoefType::Brandt => "brandt",
         CoefType::Constant => "constant",
         CoefType::BlockRandom => "block_random",
         CoefType::Circles => "circles",
@@ -295,18 +293,12 @@ fn system_path(cli: &Cli) -> (PathBuf, String) {
         CoefType::Spiral => "spiral",
     };
 
-    let coef_dir = if cli.blend_x {
-        format!("{base_coef_dir}_blend_x")
-    } else {
-        base_coef_dir.to_owned()
-    };
-
     let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("data")
         .join("anisotropy")
         //.join("isotropic")
         .join("2d")
-        .join(coef_dir);
+        .join(base_coef_dir);
     let dataset_name = format!("h{}_p1", cli.refinements);
     (data_dir, dataset_name)
 }
