@@ -13,11 +13,14 @@ use std::{
 };
 
 use faer_amg::{
+    adaptivity::ErrorPropogator,
+    core::SparseMatOp,
     decompositions::rand_svd::rand_svd,
     interpolation::smoothed_aggregation,
     partitioners::{
+        modularity::Partitioner,
         multilevel::{self, MultilevelPartitionerConfig},
-        ModularityPartitioner, Partition, PartitionBuilder,
+        Partition, PartitionerCallback, PartitionerConfig,
     },
     preconditioners::smoothers::{new_l1, StationaryIteration},
     utils::{load_mfem_linear_system, MfemLinearSystem},
@@ -109,8 +112,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("data")
-            //.join("anisotropy")
-            .join("isotropic")
+            .join("anisotropy")
+            //.join("isotropic")
             .join("2d")
             .join(&coef_dir);
 
@@ -129,6 +132,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             ..
         } = system;
 
+        let op = SparseMatOp::new(matrix, 1, faer::Par::Seq);
+        let matrix = op.arc_mat();
         info!(
         "Loaded system from {}\n  matrix: {} x {} ({} nnz)\n  rhs columns: {}\n  geom dim: {}\n  removed dirichlet nodes: {}",
         data_dir.join(dataset_name).display(),
@@ -138,25 +143,22 @@ fn main() -> Result<(), Box<dyn Error>> {
         rhs.ncols(),
         coords.ncols(),
         boundary_indices.len()
-    );
-
-        //let fine_near_null_space = smooth_vector(&matrix, cli.smoothing_iters, cli.near_null_dim, no_viz);
-        let matrix = Arc::new(matrix);
-        let fine_near_null_space = smooth_vector_rand_svd(
-            matrix.clone(),
-            cli.smoothing_iters,
-            cli.near_null_dim,
-            no_viz,
         );
+
+        let fine_near_null_space =
+            smooth_vector(op.mat_ref(), cli.smoothing_iters, cli.near_null_dim, no_viz);
+        //let fine_near_null_space = smooth_vector_rand_svd(op.clone(), cli.smoothing_iters, cli.near_null_dim, no_viz);
 
         let base_partition = Partition::singleton(matrix.nrows());
         let prev_partition = Partition::singleton(matrix.nrows());
         let level = 1;
         let safe_state: State = Arc::new(Mutex::new((level, base_partition, prev_partition)));
 
-        let dist_penalty = 1e-6;
-        let size_penalty = 1e-1;
+        //let dist_penalty = 1e-6;
+        //let dist_penalty = 0.0;
+        //let agg_size_penalty = 1e-1;
         if cli.multilevel {
+            /*
             let mut partition_builder = MultilevelPartitionerConfig::new(
                 matrix.clone(),
                 fine_near_null_space.as_ref(),
@@ -173,30 +175,30 @@ fn main() -> Result<(), Box<dyn Error>> {
             ));
             let mut ml_partitioner = partition_builder.build();
             ml_partitioner.partition();
+            */
         } else {
-            let mut partition_builder = PartitionBuilder::new(
-                matrix.clone(),
-                1,
-                fine_near_null_space.as_ref(),
-                cli.coarsening_factor,
-                size_penalty,
-                dist_penalty,
-                cli.improvement_iters,
-            );
-
-            partition_builder.callback = Some(Arc::new(
-                move |iter: usize, partitioner: &ModularityPartitioner| {
+            let callback: Option<PartitionerCallback> = Some(PartitionerCallback::new(Arc::new(
+                move |iter: usize, partitioner: &Partitioner| {
                     callback(iter, partitioner, safe_state.clone())
                 },
-            ));
-            let _partition = partition_builder.build();
+            )));
+
+            let partitioner_config = PartitionerConfig {
+                coarsening_factor: cli.coarsening_factor,
+                callback,
+                max_improvement_iters: cli.improvement_iters,
+                //dist_penalty,
+                //agg_size_penalty,
+                ..Default::default()
+            };
+            let _partition = partitioner_config.build(op, Arc::new(fine_near_null_space), None);
         }
     }
     Ok(())
 }
 
 type State = Arc<Mutex<(usize, Partition, Partition)>>;
-fn callback(iter: usize, partitioner: &ModularityPartitioner, state: State) {
+fn callback(iter: usize, partitioner: &Partitioner, state: State) {
     let p = partitioner.get_partition();
     let ((_max_agg, max_size), (_min_agg, min_size)) = partitioner.max_and_min_weighted_aggs();
 
@@ -398,7 +400,7 @@ fn initialize_visualization(
 }
 
 fn smooth_vector(
-    mat: &faer::sparse::SparseRowMat<usize, f64>,
+    mat: faer::sparse::SparseRowMatRef<usize, f64>,
     iterations: usize,
     near_null_dim: usize,
     no_viz: bool,
@@ -447,19 +449,22 @@ fn smooth_vector(
         iterations, convergence_factors
     );
 
-    x
+    x.qr().compute_thin_Q()
 }
 
 fn smooth_vector_rand_svd(
-    mat: Arc<faer::sparse::SparseRowMat<usize, f64>>,
+    op: SparseMatOp,
     iterations: usize,
     near_null_dim: usize,
     no_viz: bool,
 ) -> Mat<f64> {
-    let l1_diag = Arc::new(new_l1(mat.as_ref().as_ref()));
+    let l1_diag = Arc::new(new_l1(op.mat_ref()));
 
-    let stationary = StationaryIteration::new(mat, l1_diag, iterations);
-    let (_u, s, v) = rand_svd(stationary, near_null_dim);
+    let error_p = ErrorPropogator {
+        op: op.dyn_op(),
+        pc: l1_diag,
+    };
+    let (_u, s, v) = rand_svd(error_p, near_null_dim, 10, iterations);
 
     if !no_viz {
         let to_visualize = v.col(0);

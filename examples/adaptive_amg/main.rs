@@ -12,12 +12,12 @@ use faer::{
         IdentityPrecond, LinOp, Precond,
     },
     prelude::ReborrowMut,
-    sparse::SparseRowMat,
+    sparse::{SparseRowMat, SparseRowMatRef},
     stats::{
         prelude::StandardNormal, CwiseColDistribution, CwiseMatDistribution, DistributionExt,
         UnitaryMat,
     },
-    Col, Mat, Par,
+    Col, Mat, MatRef, Par,
 };
 use faer_amg::{
     adaptivity::{AdaptiveConfig, ErrorPropogator},
@@ -164,6 +164,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         coarsening_factor: cli.coarsening_factor,
         callback: Some(callback.clone()),
         max_improvement_iters: cli.aggregation_iters,
+        //agg_size_penalty: 1e1,
         ..Default::default()
     };
     let hierarchy_config = HierarchyConfig {
@@ -175,6 +176,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let smoother_partitioner_config = PartitionerConfig {
         coarsening_factor: cli.block_smoother_size as f64,
         callback: Some(callback.clone()),
+        //agg_size_penalty: 1e0,
         max_improvement_iters: cli.aggregation_iters,
         ..Default::default()
     };
@@ -184,6 +186,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     let multigrid_config = MultigridConfig {
         smoother_config,
+        smoothing_steps: 2,
         ..Default::default()
     };
 
@@ -195,27 +198,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         coarsening_near_null_dim: cli.coarsening_near_null_dim,
         ..Default::default()
     };
-    let multigrid = adaptive_config.build(base_mat.clone());
+    let mut composite = adaptive_config.build(base_mat.clone());
 
     let par_op = base_mat.par_op().unwrap() as Arc<dyn LinOp<f64> + Send>;
-    let arc_pc = Arc::new(multigrid);
-    let rhs_test_vecs = 10;
-
-    let iterations = 5;
-    let error_prop = ErrorPropogator {
-        op: par_op.clone(),
-        pc: arc_pc.clone(),
-    };
-    let (_u, s, _v) = rand_svd(error_prop, rhs_test_vecs, 5, iterations);
-    let convergence_factors: String = s
-        .into_column_vector()
-        .iter()
-        .map(|singular_value| format!("{:.2} ", singular_value.powf((iterations as f64).recip())))
-        .collect();
-    info!(
-        "near-null smoothing convergence factors: {}",
-        convergence_factors
-    );
+    let arc_pc = Arc::new(composite.clone());
 
     info!(
         "Running PCG solve with tolerance {:.2e} and max {} iterations",
@@ -224,7 +210,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let rhs_vec: Col<f64> = rhs_full.col(0).to_owned();
 
     let rng = &mut StdRng::seed_from_u64(42);
-    let mut dst = CwiseColDistribution {
+    let initial_guess = CwiseColDistribution {
         nrows: rhs_full.nrows(),
         dist: StandardNormal,
     }
@@ -238,45 +224,122 @@ fn main() -> Result<(), Box<dyn Error>> {
         ..Default::default()
     };
 
-    let matrix = base_mat.mat_ref();
-    let stack_req = conjugate_gradient_scratch(arc_pc.as_ref(), matrix, 1, par);
-    let mut buf = MemBuffer::new(stack_req);
-    let stack = MemStack::new(&mut buf);
-
-    let result = conjugate_gradient(
-        dst.as_mut().as_mat_mut(),
-        arc_pc.as_ref(),
-        matrix.as_ref(),
+    let results = run_composite_pcg(
+        &mut composite,
+        base_mat,
         rhs_vec.as_mat(),
+        &initial_guess,
         params,
-        |_| {},
         par,
-        stack,
-    );
-
-    report(result)?;
-
-    let mut residual = matrix.as_ref().as_ref() * dst.as_mat();
-    residual -= rhs_vec.as_mat();
-    let residual_norm = residual.norm_l2();
-    let rhs_norm = rhs_vec.as_mat().norm_l2();
-    let rel_residual = residual_norm / rhs_norm.max(1e-32);
-    info!(
-        "Final relative residual {:.2e} (||Ax-b|| = {:.2e}, ||b|| = {:.2e})",
-        rel_residual, residual_norm, rhs_norm
-    );
+    )?;
+    let table = build_results_table(&results);
+    info!("Composite PCG results:\n{table}");
 
     Ok(())
 }
 
-fn report(result: Result<CgInfo<f64>, CgError<f64>>) -> Result<(), Box<dyn Error>> {
+type CompositeResult = (usize, usize, usize, f64, f64, f64);
+
+fn run_composite_pcg(
+    composite: &mut faer_amg::preconditioners::composite::Composite,
+    matrix: SparseMatOp,
+    rhs: MatRef<'_, f64>,
+    initial_guess: &Col<f64>,
+    params: CgParams<f64>,
+    par: Par,
+) -> Result<Vec<CompositeResult>, Box<dyn Error>> {
+    let mut results = Vec::new();
+    while !composite.components().is_empty() {
+        let component_count = composite.components().len();
+        let arc_pc = Arc::new(composite.clone());
+        let stack_req =
+            conjugate_gradient_scratch(arc_pc.as_ref(), matrix.par_op().unwrap().as_ref(), 1, par);
+        let mut buf = MemBuffer::new(stack_req);
+        let stack = MemStack::new(&mut buf);
+        let mut dst = initial_guess.clone();
+
+        let result = conjugate_gradient(
+            dst.as_mut().as_mat_mut(),
+            arc_pc.as_ref(),
+            matrix.par_op().unwrap().as_ref(),
+            rhs,
+            params,
+            |_| {},
+            par,
+            stack,
+        );
+
+        let info = report(result)?;
+
+        let mut residual = matrix.mat_ref() * dst.as_mat();
+        residual -= rhs;
+        let residual_norm = residual.norm_l2();
+        let rhs_norm = rhs.norm_l2();
+        let rel_residual = residual_norm / rhs_norm.max(1e-32);
+
+        let vcycles_per_iter = 2 * component_count - 1;
+        let total_vcycles = info.iter_count * vcycles_per_iter;
+        let reduction_per_iter = if info.iter_count > 0 {
+            info.rel_residual.powf(1.0 / info.iter_count as f64)
+        } else {
+            0.0
+        };
+        let reduction_per_vcycle = if total_vcycles > 0 {
+            info.rel_residual.powf(1.0 / total_vcycles as f64)
+        } else {
+            0.0
+        };
+        results.push((
+            component_count,
+            info.iter_count,
+            total_vcycles,
+            reduction_per_iter,
+            reduction_per_vcycle,
+            rel_residual,
+        ));
+
+        composite.components_mut().pop();
+    }
+
+    Ok(results)
+}
+
+fn build_results_table(results: &[CompositeResult]) -> String {
+    let mut table = String::new();
+    table.push_str("+------------+------------+------------+----------------------+----------------------+----------------------+\n");
+    table.push_str("| components | iterations | v-cycles   | reduction/iter       | reduction/v-cycle    | final rel residual   |\n");
+    table.push_str("+------------+------------+------------+----------------------+----------------------+----------------------+\n");
+    for (
+        component_count,
+        iter_count,
+        total_vcycles,
+        reduction_per_iter,
+        reduction_per_vcycle,
+        rel_residual,
+    ) in results
+    {
+        table.push_str(&format!(
+            "| {:>10} | {:>10} | {:>10} | {:>20.3} | {:>20.3} | {:>20.3e} |\n",
+            component_count,
+            iter_count,
+            total_vcycles,
+            reduction_per_iter,
+            reduction_per_vcycle,
+            rel_residual
+        ));
+    }
+    table.push_str("+------------+------------+------------+----------------------+----------------------+----------------------+\n");
+    table
+}
+
+fn report(result: Result<CgInfo<f64>, CgError<f64>>) -> Result<CgInfo<f64>, Box<dyn Error>> {
     match result {
         Ok(info) => {
             info!(
                 "CG converged in {} iterations (abs {:.2e}, rel {:.2e})",
                 info.iter_count, info.abs_residual, info.rel_residual
             );
-            Ok(())
+            Ok(info)
         }
         Err(err) => Err(format!("CG failed: {err:?}").into()),
     }

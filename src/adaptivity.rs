@@ -5,13 +5,15 @@ use faer::diag::Diag;
 use faer::dyn_stack::{MemBuffer, MemStack, StackReq};
 use faer::linalg::matmul::dot::inner_prod;
 use faer::linalg::temp_mat_scratch;
+use faer::mat::AsMatRef;
 use faer::matrix_free::{BiLinOp, BiPrecond, LinOp, Precond};
-use faer::prelude::ReborrowMut;
+use faer::prelude::{Reborrow, ReborrowMut};
 use faer::stats::prelude::StandardNormal;
 use faer::stats::{CwiseMatDistribution, DistributionExt};
 use faer::{get_global_parallelism, Col, ColRef, Mat, MatMut, MatRef, Par};
 use log::info;
-use rand::rng;
+use rand::rngs::StdRng;
+use rand::{rng, SeedableRng};
 
 use crate::core::SparseMatOp;
 use crate::decompositions::rand_svd::rand_svd;
@@ -57,26 +59,34 @@ impl AdaptiveConfig {
         let oversample = 5;
         let par = get_global_parallelism();
 
-        let mut error_prop = ErrorPropogator {
-            op: mat.dyn_op(),
-            pc: l1_diag,
-        };
-        let (_u, s, smoothed) = rand_svd(
-            &error_prop,
-            self.coarsening_near_null_dim - 1,
-            oversample,
+        let (smoothed, mut cfs) = smooth_vector(
+            mat.clone(),
+            l1_diag.clone(),
             self.test_iters,
+            //self.coarsening_near_null_dim - 1,
+            self.coarsening_near_null_dim,
+            false,
         );
-        report_convergence(s.column_vector());
 
+        /*
         let mut with_constant = Mat::ones(smoothed.nrows(), self.coarsening_near_null_dim);
         with_constant
             .subcols_mut(1, self.coarsening_near_null_dim - 1)
             .copy_from(smoothed);
         let basis = with_constant.qr().compute_thin_Q();
+        */
+        let basis = smoothed;
 
+        print!("||Ev||_A^(1/cycles): ");
+        cfs.iter_mut().for_each(|reduction| {
+            print!("{:.3} ", reduction);
+            *reduction = (1. - *reduction).recip();
+        });
+        println!();
         let initial_near_null = Arc::new(basis);
-        let initial_hierarchy = self.hierarchy_config.build(mat.clone(), initial_near_null);
+        let initial_hierarchy =
+            self.hierarchy_config
+                .build(mat.clone(), initial_near_null, Some(cfs));
         info!("Hierarchy 1 info:\n{:?}", initial_hierarchy);
         let first_component = self.multigrid_config.build(initial_hierarchy);
         let mut composite = Composite::new(mat.dyn_op(), Arc::new(first_component));
@@ -87,35 +97,26 @@ impl AdaptiveConfig {
                 n_components
             );
 
-            error_prop.pc = Arc::new(composite.clone());
-            let (u, s, smoothed) = rand_svd(
-                &error_prop,
-                self.coarsening_near_null_dim,
-                oversample,
+            let arc_comp = Arc::new(composite.clone());
+            let (smoothed, mut cfs) = smooth_vector(
+                mat.clone(),
+                arc_comp,
                 self.test_iters,
+                self.coarsening_near_null_dim,
+                false,
             );
-            report_convergence(s.column_vector());
-            let mut mem = MemBuffer::new(StackReq::any_of(&[
-                error_prop.apply_scratch(self.coarsening_near_null_dim, par),
-                error_prop.transpose_apply_scratch(self.coarsening_near_null_dim, par),
-            ]));
-            let stack = MemStack::new(&mut mem);
-            let mut maybe_u = Mat::zeros(u.nrows(), u.ncols());
-            error_prop.apply(maybe_u.as_mut(), smoothed.as_ref(), par, stack);
-            let maybe_s = Col::from_fn(u.ncols(), |i| maybe_u.col(i).norm_l2());
-            report_convergence(maybe_s.as_ref());
-            let maybe_s = Col::from_fn(u.ncols(), |i| {
-                inner_prod(
-                    u.col(i).adjoint(),
-                    faer::Conj::No,
-                    maybe_u.col(i),
-                    faer::Conj::No,
-                )
+            let n_vcycles = (n_components * 2 - 1) as f64;
+            print!("||Ev||_A^(1/cycles): ");
+            cfs.iter_mut().for_each(|reduction| {
+                let cf_per_cycle = reduction.powf(n_vcycles.recip());
+                print!("{:.3} ", cf_per_cycle);
+                *reduction = (1. - cf_per_cycle).recip();
             });
-            report_convergence(maybe_s.as_ref());
-
+            println!();
             let near_null = Arc::new(smoothed);
-            let hierarchy = self.hierarchy_config.build(mat.clone(), near_null);
+            let hierarchy = self
+                .hierarchy_config
+                .build(mat.clone(), near_null, Some(cfs));
             info!("Hierarchy {} info:\n{:?}", n_components + 1, hierarchy);
             let component = self.multigrid_config.build(hierarchy);
             composite.push(Arc::new(component));
@@ -203,14 +204,6 @@ impl BiLinOp<f64> for ErrorPropogator {
 impl Precond<f64> for ErrorPropogator {}
 impl BiPrecond<f64> for ErrorPropogator {}
 
-fn report_convergence(s: ColRef<f64>) {
-    let convergence_factors: String = s
-        .iter()
-        .map(|singular_value| format!("{:.3} ", singular_value))
-        .collect();
-    info!("sampled convergence factors: {}", convergence_factors);
-}
-
 /// Builds an approximate near-null space by repeatedly smoothing random vectors and
 /// extracting the dominant right singular vectors via randomized SVD.
 pub fn smooth_vector_rand_svd(
@@ -225,7 +218,6 @@ pub fn smooth_vector_rand_svd(
         pc: l1_diag,
     };
     let (_u, s, v) = rand_svd(error_p, near_null_dim, 10, iterations);
-    report_convergence(s.column_vector());
 
     v
 }
@@ -237,8 +229,13 @@ pub fn find_near_null(
     smoothing_block_size: usize,
 ) -> Mat<f64> {
     let simple_pc = new_l1(mat.mat_ref());
-    let (smooth_basis, _singular_values) =
-        smooth_vector(mat.clone(), Arc::new(simple_pc), iterations, near_null_dim);
+    let (smooth_basis, _) = smooth_vector(
+        mat.clone(),
+        Arc::new(simple_pc),
+        iterations,
+        near_null_dim,
+        false,
+    );
 
     let partitioner_config = PartitionerConfig {
         coarsening_factor: smoothing_block_size as f64,
@@ -250,8 +247,13 @@ pub fn find_near_null(
         ..Default::default()
     };
     let block_pc = block_smoother_config.build(mat.clone(), Arc::new(smooth_basis));
-    let (smooth_basis, _singular_values) =
-        smooth_vector(mat.clone(), Arc::new(block_pc), iterations, near_null_dim);
+    let (smooth_basis, _) = smooth_vector(
+        mat.clone(),
+        Arc::new(block_pc),
+        iterations,
+        near_null_dim,
+        false,
+    );
     smooth_basis
 }
 
@@ -260,10 +262,11 @@ fn smooth_vector(
     pc: Arc<dyn LinOp<f64> + Send>,
     iterations: usize,
     near_null_dim: usize,
-) -> (Mat<f64>, Diag<f64>) {
+    report: bool,
+) -> (Mat<f64>, Vec<f64>) {
     let iteration = ErrorPropogator {
         op: mat.dyn_op(),
-        pc,
+        pc: pc.clone(),
     };
 
     let n = mat.mat_ref().nrows();
@@ -294,23 +297,85 @@ fn smooth_vector(
     );
     x = x.qr().compute_thin_Q();
 
-    for _ in 0..std::cmp::min(iterations, 5) {
+    for _ in 0..iterations {
         iteration.apply_in_place(x.as_mut(), par, stack);
+        x = x.qr().compute_thin_Q();
     }
-    let svd = x.thin_svd().unwrap();
-
-    let u = svd.U().subcols(0, near_null_dim).to_owned();
-    let s = svd
-        .S()
-        .column_vector()
-        .subrows(0, near_null_dim)
-        .to_owned()
-        .into_diagonal();
 
     let duration = Instant::now() - start;
     info!(
         "Finished smooth vec search in {} seconds",
         duration.as_secs()
     );
-    (u, s)
+
+    //let svd = x.thin_svd().unwrap();
+    //let u = svd.U().subcols(0, near_null_dim).to_owned();
+    let mut a_norms = String::from("||w||_A:  ");
+    let mut e_norms = String::from("~||E||_A: ");
+    let mut cfs = Vec::new();
+    for w in x.col_iter() {
+        let mut aw = Col::zeros(w.nrows());
+        mat.dyn_op().apply(aw.as_mat_mut(), w.as_mat(), par, stack);
+        let w_a_norm = (w.transpose() * aw.rb()).sqrt();
+        let mut ev = Col::zeros(w.nrows());
+        pc.apply(ev.as_mat_mut(), aw.as_mat(), par, stack);
+        ev = w - ev;
+        let mut aev = Col::zeros(w.nrows());
+        mat.dyn_op()
+            .apply(aev.as_mat_mut(), ev.as_mat(), par, stack);
+        let ev_a_norm = (ev.transpose() * aev).sqrt();
+        let convergence_factor = ev_a_norm / w_a_norm;
+        a_norms.push_str(&format!("{:.3} ", w_a_norm));
+        e_norms.push_str(&format!("{:.3} ", convergence_factor));
+        cfs.push(convergence_factor);
+    }
+
+    if report {
+        info!("{}", a_norms);
+        info!("{}", e_norms);
+    }
+
+    (x.subcols(0, near_null_dim).to_owned(), cfs)
 }
+
+/*
+fn smooth_vector(
+    mat: SparseMatOp,
+    pc: Arc<dyn LinOp<f64> + Send>,
+    iterations: usize,
+    near_null_dim: usize,
+) -> (Mat<f64>, Diag<f64>) {
+    let mat = mat.mat_ref();
+    let l1_diag = new_l1(mat);
+
+    let rng = &mut StdRng::seed_from_u64(42);
+    let n = mat.nrows();
+
+    let mut x = CwiseMatDistribution {
+        nrows: n,
+        ncols: near_null_dim,
+        dist: StandardNormal,
+    }
+    .rand::<Mat<f64>>(rng);
+    let mut r;
+
+    for _ in 0..=iterations {
+        x = x.qr().compute_thin_Q();
+
+        r = mat * &x;
+        r = &l1_diag * r;
+        x -= r;
+    }
+
+    let convergence_factors: String = x
+        .col_iter()
+        .map(|col| format!("{:.2} ", col.norm_l2()))
+        .collect();
+    info!(
+        "converge factor after {} iterations: {}",
+        iterations, convergence_factors
+    );
+
+    (x.qr().compute_thin_Q(), Diag::zeros(x.nrows()))
+}
+*/

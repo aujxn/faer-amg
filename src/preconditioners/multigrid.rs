@@ -62,25 +62,39 @@ impl MultigridConfig {
         let level_count = hierarchy.levels();
         let mut smoothers: Vec<Arc<dyn BiPrecond<f64> + Send>> = Vec::with_capacity(level_count);
 
-        let mut partition_config = hierarchy.get_config().partitioner_config.clone();
+        //let mut partition_config = hierarchy.get_config().partitioner_config.clone();
+        let mut partition_config = self.smoother_config.partitioner_config.clone();
+        /*
         let n_levels = 4;
-        let cf: f64 = 128.;
-        partition_config.coarsening_factor = cf.powf(1. / n_levels as f64);
-        partition_config.max_improvement_iters = 100;
+        //let cf: f64 = 128.;
+        partition_config.coarsening_factor = partition_config
+            .coarsening_factor
+            .powf(1. / n_levels as f64);
+        partition_config.max_improvement_iters = 20;
         let ml_partitioner_config = MultilevelPartitionerConfig {
             partitioner_configs: vec![partition_config; n_levels],
         };
+        */
         let mut smoother_partitions = vec![];
         for level in 0..(level_count - 1) {
             let op = hierarchy.get_op(level);
             let near_null = hierarchy.get_near_null(level);
-            //let partition = partition_config.build_partition(op, near_null);
-            let partitions = ml_partitioner_config.build_hierarchy(op.clone(), near_null);
+            let partition = partition_config.build_partition(op, near_null);
+            smoother_partitions.push(Arc::new(partition));
+            /*
+            let partitions = ml_partitioner_config.build_hierarchy(op.clone(), near_null.clone());
             let mut partition = Partition::singleton(op.mat_ref().nrows() / op.block_size());
             for p in partitions {
                 partition.compose(&p);
             }
-            smoother_partitions.push(Arc::new(partition));
+
+            let final_partitioner = self.smoother_config.partitioner_config.build(
+                op.clone(),
+                near_null,
+                Some(partition),
+            );
+            smoother_partitions.push(Arc::new(final_partitioner.into_partition()));
+            */
         }
 
         for level in 0..level_count {
@@ -98,10 +112,16 @@ impl MultigridConfig {
                 };
             smoothers.push(smoother);
         }
+
         /*
         for level in 0..level_count {
-            let smoother: Arc<dyn BiPrecond<f64> + Send> =
-                Arc::new(new_l1(hierarchy.get_mat_ref(level)));
+            let op = hierarchy.get_mat_ref(level);
+            let smoother: Arc<dyn BiPrecond<f64> + Send> = if level + 1 == level_count {
+                //&& self.coarse_solver.is_some() {
+                self.coarse_solver.unwrap().build_from_sparse(op)
+            } else {
+                Arc::new(new_l1(op))
+            };
             smoothers.push(smoother);
         }
         */
@@ -148,6 +168,7 @@ pub struct Multigrid {
     interpolations: Vec<Arc<dyn LinOp<f64> + Send>>,
     restrictions: Vec<Arc<dyn LinOp<f64> + Send>>,
     cycle_type: usize,
+    smoothing_steps: usize,
 }
 
 const DEBUG: bool = false;
@@ -166,6 +187,7 @@ impl Multigrid {
             interpolations: Vec::new(),
             restrictions: Vec::new(),
             cycle_type: 1,
+            smoothing_steps: 1,
         }
     }
 
@@ -220,7 +242,13 @@ impl Multigrid {
         stack: &mut MemStack,
     ) {
         let mut v = Mat::zeros(out.nrows(), out.ncols());
+        if DEBUG {
+            println!("-----");
+        }
         self.cycle(v.as_mut(), rhs, 0, par, stack);
+        if DEBUG {
+            println!("-----");
+        }
         out += v;
     }
 
@@ -233,14 +261,32 @@ impl Multigrid {
         stack: &mut MemStack,
     ) {
         let smoother = &self.smoothers[level];
-        if level == self.operators.len() - 1 {
-            smoother.apply(v, f, par, stack);
-            return;
-        }
         let mut work = Mat::zeros(v.nrows(), v.ncols());
         let op = &self.operators[level];
+        if level == self.operators.len() - 1 {
+            if DEBUG {
+                op.apply(work.rb_mut(), v.as_ref(), par, stack);
+                work = f - work.rb();
+                let norm = work.norm_l2();
+                for _ in 0..level + 1 {
+                    print!("\t");
+                }
+                println!("pre smooth:  {:.3e}", norm);
+            }
 
-        forward_smooth(v.rb_mut(), f, op.clone(), smoother.clone(), par, stack, 1);
+            smoother.apply(v.rb_mut(), f, par, stack);
+            if DEBUG {
+                op.apply(work.rb_mut(), v.as_ref(), par, stack);
+                work = f - work.rb();
+                let norm = work.norm_l2();
+                for _ in 0..level + 1 {
+                    print!("\t");
+                }
+                println!("post smooth: {:.3e}", norm);
+            }
+            return;
+        }
+
         if DEBUG {
             op.apply(work.rb_mut(), v.as_ref(), par, stack);
             work = f - work.rb();
@@ -248,7 +294,27 @@ impl Multigrid {
             for _ in 0..level + 1 {
                 print!("\t");
             }
-            println!("{:?}", norm);
+            println!("pre smooth:  {:.3e}", norm);
+        }
+
+        smooth(
+            v.rb_mut(),
+            f,
+            op.clone(),
+            smoother.clone(),
+            par,
+            stack,
+            self.smoothing_steps,
+        );
+
+        if DEBUG {
+            op.apply(work.rb_mut(), v.as_ref(), par, stack);
+            work = f - work.rb();
+            let norm = work.norm_l2();
+            for _ in 0..level + 1 {
+                print!("\t");
+            }
+            println!("post smooth: {:.3e}", norm);
         }
 
         if level < self.operators.len() - 1 {
@@ -268,7 +334,6 @@ impl Multigrid {
 
             interp.apply(work.rb_mut(), v_coarse.as_ref(), par, stack);
             v += &work;
-            backward_smooth(v.rb_mut(), f, op.clone(), smoother.clone(), par, stack, 1);
             if DEBUG {
                 op.apply(work.rb_mut(), v.as_ref(), par, stack);
                 work = f - work.rb();
@@ -276,12 +341,32 @@ impl Multigrid {
                 for _ in 0..level + 1 {
                     print!("\t");
                 }
-                println!("{:?}", norm);
+                println!("pre smooth:  {:.3e}", norm);
+            }
+
+            smooth(
+                v.rb_mut(),
+                f,
+                op.clone(),
+                smoother.clone(),
+                par,
+                stack,
+                self.smoothing_steps,
+            );
+            if DEBUG {
+                op.apply(work.rb_mut(), v.as_ref(), par, stack);
+                work = f - work.rb();
+                let norm = work.norm_l2();
+                for _ in 0..level + 1 {
+                    print!("\t");
+                }
+                println!("post smooth: {:.3e}", norm);
             }
         }
     }
 }
 
+/*
 fn forward_smooth(
     x: MatMut<'_, f64>,
     b: MatRef<'_, f64>,
@@ -294,6 +379,7 @@ fn forward_smooth(
     let mut work = Mat::zeros(x.nrows(), x.ncols());
     let mut x = x;
     // first iteration of forward `x` is 0 so residual is `b`
+    // only works with v-cycle though...
     pc.apply(x.rb_mut(), b, par, stack);
     for _ in 1..max_iter {
         op.apply(work.rb_mut(), x.rb(), par, stack);
@@ -302,8 +388,9 @@ fn forward_smooth(
         x += r;
     }
 }
+*/
 
-fn backward_smooth(
+fn smooth(
     x: MatMut<'_, f64>,
     b: MatRef<'_, f64>,
     op: Arc<dyn LinOp<f64>>,
@@ -317,7 +404,7 @@ fn backward_smooth(
     for _ in 0..max_iter {
         op.apply(work.rb_mut(), x.rb(), par, stack);
         let mut r = b - &work;
-        pc.transpose_apply_in_place(r.rb_mut(), par, stack);
+        pc.apply_in_place(r.rb_mut(), par, stack);
         x += r;
     }
 }

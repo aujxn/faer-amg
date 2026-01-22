@@ -271,15 +271,10 @@ impl Partitioner {
     }
 
     pub fn total_agg_size_cost(&self) -> f64 {
-        let cf = self.config.coarsening_factor;
-        let agg_pen = self.config.agg_size_penalty;
         self.agg_sizes
             .par_iter()
             .copied()
-            .map(|agg_size| {
-                let diff = cf - agg_size as f64;
-                diff.powf(2.0) * agg_pen
-            })
+            .map(|agg_size| self.size_cost(agg_size))
             .sum::<f64>()
     }
 
@@ -417,12 +412,17 @@ impl Partitioner {
         (pairs, unmatched)
     }
 
+    fn size_cost(&self, size: usize) -> f64 {
+        let cf = self.config.coarsening_factor;
+        let relative_diff = (size as f64 - cf).abs() / cf;
+        (4.0 * relative_diff).powf(4.) * self.config.agg_size_penalty
+    }
+
     fn delta_q(&self, node_i: usize, source_agg: Option<usize>, dest_agg: usize) -> f64 {
         let mut in_degree = 0.0;
         let mut out_degree = 0.0;
-        let old_dst_size = self.agg_sizes[dest_agg] as f64;
-        let new_dst_size = (self.agg_sizes[dest_agg] + self.node_weights[node_i]) as f64;
-        let cf = self.config.coarsening_factor;
+        let old_dst_size = self.agg_sizes[dest_agg];
+        let new_dst_size = self.agg_sizes[dest_agg] + self.node_weights[node_i];
         let old_size_cost;
         let new_size_cost;
         let mut old_dist_cost = 0.0;
@@ -448,10 +448,10 @@ impl Partitioner {
                         }
                     }
                 }
-                let old_src_size = self.agg_sizes[source_agg] as f64;
-                let new_src_size = (self.agg_sizes[source_agg] - self.node_weights[node_i]) as f64;
-                old_size_cost = (old_dst_size - cf).powf(2.0) + (old_src_size - cf).powf(2.0);
-                new_size_cost = (new_dst_size - cf).powf(2.0) + (new_src_size - cf).powf(2.0);
+                let old_src_size = self.agg_sizes[source_agg];
+                let new_src_size = self.agg_sizes[source_agg] - self.node_weights[node_i];
+                old_size_cost = self.size_cost(old_dst_size) + self.size_cost(old_src_size);
+                new_size_cost = self.size_cost(new_dst_size) + self.size_cost(new_src_size);
                 if let Some(distances) = self.distances.as_deref() {
                     old_dist_cost = distances[node_i].powf(2.0);
                 }
@@ -473,8 +473,8 @@ impl Partitioner {
                         }
                     }
                 }
-                old_size_cost = (old_dst_size - cf).powf(2.0);
-                new_size_cost = (new_dst_size - cf).powf(2.0);
+                old_size_cost = self.size_cost(old_dst_size);
+                new_size_cost = self.size_cost(new_dst_size);
             }
         }
         if self.distances.is_none() {

@@ -169,6 +169,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         coarsening_factor: cli.coarsening_factor,
         callback: Some(callback.clone()),
         max_improvement_iters: cli.aggregation_iters,
+        //agg_size_penalty: 1e1,
         ..Default::default()
     };
     let hierarchy_config = HierarchyConfig {
@@ -204,12 +205,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     let multigrid_config = MultigridConfig {
         smoother_config,
+        smoothing_steps: 1,
+        //mu: 2,
         ..Default::default()
     };
     let multigrid = multigrid_config.build(hierarchy);
 
     let par_op = base_mat.par_op().unwrap() as Arc<dyn LinOp<f64> + Send>;
     let arc_pc = Arc::new(multigrid);
+    /*
     println!("Preconditioner symmetry test:");
     symmetry_test(arc_pc.clone());
     let rhs_test_vecs = 10;
@@ -221,6 +225,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     println!("Error prop symmetry test:");
     symmetry_test(Arc::new(error_prop.clone()));
+
     let (_u, s, v) = rand_svd(error_prop.clone(), rhs_test_vecs, 5, iterations);
 
     let mut mem = MemBuffer::new(StackReq::any_of(&[
@@ -260,6 +265,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "near-null smoothing convergence factors: {}",
         convergence_factors
     );
+    */
 
     info!(
         "Running PCG solve with tolerance {:.2e} and max {} iterations",

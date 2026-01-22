@@ -6,8 +6,8 @@ license = "MIT"
 description = "Adaptive smoothed aggregation algebraic multigrid preconditioner for numerical linear algebra applications"
 
 [dependencies]
-faer = "0.23"
-faer-traits = { path = "../faer-rs/faer-traits", version = "0.22" }
+faer = { path = "../faer-rs/faer" }
+faer-traits = { path = "../faer-rs/faer-traits" }
 log = "0.4.28"
 matrix-market-rs = "0.1.3"
 petgraph = "0.8.3"
