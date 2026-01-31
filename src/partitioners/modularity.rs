@@ -279,6 +279,7 @@ impl Partitioner {
     }
 
     pub fn total_dist_cost(&self) -> f64 {
+        return 0.0;
         let dist_pen = self.config.dist_penalty;
         if let Some(distances) = self.distances.as_deref() {
             distances.iter().map(|dist| dist.powf(2.)).sum::<f64>() * dist_pen
@@ -494,7 +495,7 @@ impl Partitioner {
         let max_iter = self.config.max_improvement_iters;
         for pass in 0..max_iter {
             let agg_graphs = self.agg_graphs();
-            self.update_centers_and_distances(&agg_graphs);
+            //self.update_centers_and_distances(&agg_graphs);
 
             /* This version can break aggregates into disconnected components...
             let mut swaps: Vec<(usize, usize, f64)> = self

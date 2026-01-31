@@ -1,23 +1,38 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    f64,
-};
-
 use faer::{
     diag::{self, Diag, DiagRef},
+    dyn_stack::{MemBuffer, MemStack},
+    get_global_parallelism,
     linalg::matmul::dot::inner_prod,
     mat::{AsMatMut, AsMatRef},
-    matrix_free::LinOp,
+    matrix_free::{LinOp, Precond},
     prelude::{Reborrow, ReborrowMut, Solve, SolveLstsq},
     sparse::{ops::add_assign, SparseRowMat, SparseRowMatRef, Triplet},
     Col, ColRef, Mat, MatMut, MatRef, Row, RowRef,
 };
-use log::{info, warn};
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use itertools::Itertools;
+use log::{info, trace, warn};
+use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    f64,
+    sync::Arc,
+};
+
+// TODO: split this up into seperate modules for aggregation and ruge-stuben like interpolation schemes
+//pub mod classical;
+//pub mod aggregation;
 
 use crate::{
-    partitioners::{AdjacencyList, Partition},
-    preconditioners::block_smoothers::{diagonally_compensate, diagonally_compensate_vector},
+    adaptivity::ErrorPropogator,
+    core::SparseMatOp,
+    hierarchy::PartitionType,
+    partitioners::{extract_local_subgraph, AdjacencyList, Partition, PartitionerConfig},
+    preconditioners::{
+        block_smoothers::{
+            diagonally_compensate, diagonally_compensate_vector, BlockSmootherConfig,
+        },
+        smoothers::new_l1,
+    },
     utils::{matrix_stats, MatrixStats},
 };
 
@@ -38,120 +53,301 @@ impl InterpolationInfo {
     }
 }
 
-/*
-#[derive(Clone, Debug, Serialize)]
-pub struct InterpViz {
-    pub functions: Mat<f64>,
-    pub interpolated: Mat<f64>,
-    pub c_points: Vec<usize>,
+#[derive(Clone, Copy, Debug)]
+pub enum InterpMode {
+    Constrained,
+    Regularized,
 }
-*/
 
-fn best_coarse(agg: &BTreeSet<usize>, near_null: MatRef<f64>, w: DiagRef<f64>) -> (usize, f64) {
-    let mut best_node_id = *agg.first().unwrap();
-    let mut best_error = f64::MAX;
+#[derive(Clone, Debug)]
+struct LsInterpResult {
+    /// Active weights, aligned with `set` (same length).
+    weights: Row<f64>,
+    /// Local indices into the candidate `vc` rows.
+    set: Vec<usize>,
+    /// Weighted squared error.
+    err: f64,
+}
 
-    let mut vf = Mat::zeros(agg.len(), near_null.ncols());
-    for (node_id, mut local_row) in agg.iter().zip(vf.row_iter_mut()) {
-        local_row.copy_from(near_null.row(*node_id));
-    }
-
-    /*
-    let trace = vf
-        .col_iter()
-        .zip(w.column_vector().iter())
-        .map(|(vi, wi)| vi.squared_norm_l2() * wi)
-        .sum::<f64>();
-    */
-    //println!("{:?}", vf);
-
-    for (vc, node_id) in vf.row_iter().zip(agg.iter()) {
-        //println!("------------");
-        /*
-        let w_vc = w.rb() * vc.transpose();
-        let p = vf.rb() * w_vc.rb();
-        let numerator = p.squared_norm_l2();
-        let denom = vc.rb() * w_vc.rb();
-        //let p = p / denom;
-        let error_norm = trace - numerator / denom;
-        */
-        let error_norm = vf
-            .row_iter()
-            .map(|vf| weighted_least_squares(w, vc.as_mat(), vf.rb()).1)
-            .sum::<f64>();
-        //println!("{:?}", p);
-        //println!("{:?}", p.rb() * vc.as_mat());
-        if error_norm < best_error {
-            best_error = error_norm;
-            best_node_id = *node_id;
+impl LsInterpResult {
+    fn empty(err: f64) -> Self {
+        Self {
+            weights: Row::<f64>::zeros(0),
+            set: Vec::new(),
+            err,
         }
     }
-    //panic!();
-    (best_node_id, best_error)
+
+    fn size(&self) -> usize {
+        self.set.len()
+    }
 }
 
-pub fn weighted_least_squares(
-    d: DiagRef<f64>,
-    vc: MatRef<f64>,
-    vf: RowRef<f64>,
-) -> (Row<f64>, f64) {
-    let k = vf.ncols();
-    let m = vc.nrows();
-    assert_eq!(
-        k,
-        vc.ncols(),
-        "incompatibale interpolation dimensions (columns don't match): vf: {:?} and vc: {:?}",
-        vf.shape(),
-        vc.shape()
-    );
-    assert_eq!(
-        k,
-        d.ncols(),
-        "weight matrix wrong size: vf: {:?}, vc: {:?}, k: {}",
-        vf.shape(),
-        vc.shape(),
-        d.nrows()
-    );
-    assert!(
-        k > m,
-        "need more test vectors than coarse points: k: {}, vc: {:?}",
-        k,
-        vc.shape()
-    );
+// negative weights allowed for regularized LS approach
+fn validate_weights(p: RowRef<f64>, min_abs: f64, min_rel: f64) -> bool {
+    let mut max_w: f64 = 0.0;
+    for &x in p.iter() {
+        if !x.is_finite() || x.abs() < min_abs {
+            return false;
+        }
+        max_w = max_w.max(x.abs());
+    }
 
-    let a = d.rb() * vc.transpose();
-    let b = d.rb() * vf.transpose();
+    let rel_thr = min_rel * max_w;
+    for &x in p.iter() {
+        if x.abs() < rel_thr {
+            return false;
+        }
+    }
+    true
+}
 
-    let mut gram = a.transpose() * a.rb();
-    let lambda = 1e-3;
-    /*
-    let eta = 1e-1;
+// only positive weights allowed for constrained LS approach
+fn validate_weights_constrained(p: RowRef<f64>, min_abs: f64, min_rel: f64, feas: f64) -> bool {
+    let mut max_w: f64 = 0.0;
+    let mut sum: f64 = 0.0;
+    for &x in p.iter() {
+        if !x.is_finite() || x < min_abs {
+            return false;
+        }
+        max_w = max_w.max(x);
+        sum += x;
+    }
+
+    if sum > 1.0 + feas {
+        return false;
+    }
+
+    let rel_thr = min_rel * max_w;
+
+    for &x in p.iter() {
+        if x < rel_thr {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn extract_gram_rhs(gram: MatRef<f64>, g: ColRef<f64>, idx: &[usize]) -> (Mat<f64>, Col<f64>) {
+    let r = idx.len();
+    let mut gram_ff = Mat::zeros(r, r);
+    let mut gf = Col::zeros(r);
+    for (ii, &i) in idx.iter().enumerate() {
+        gf[ii] = g[i];
+        for (jj, &j) in idx.iter().enumerate() {
+            gram_ff[(ii, jj)] = gram[(i, j)];
+        }
+    }
+    (gram_ff, gf)
+}
+
+fn eval_err(gram_ff: MatRef<f64>, p_row: RowRef<f64>, gf: ColRef<f64>, btb: f64) -> f64 {
+    let p_col = p_row.transpose();
+    let quad = p_row.rb() * gram_ff * p_col.rb();
+    let lin = gf.transpose() * p_col.rb();
+    btb + quad - 2.0 * lin
+}
+
+fn weighted_least_squares(
+    gram_ff: MatRef<f64>,
+    gf: ColRef<f64>,
+    btb: f64,
+) -> Option<(Row<f64>, f64)> {
+    let min_abs = 1e-10;
+    let min_rel = 1e-2;
+    let eta = 1e-2;
     let lambda = eta
-        * gram
+        * gram_ff
             .self_adjoint_eigenvalues(faer::Side::Upper)
             .unwrap()
             .last()
-            .unwrap()
-            .sqrt();
-    */
-    gram.diagonal_mut().for_each_mut(|d| *d = *d + lambda);
-    let llt = gram.llt(faer::Side::Upper).unwrap();
+            .unwrap();
 
-    let rhs = a.transpose() * b.rb();
-    let p_t = llt.solve(rhs);
-    let p = p_t.transpose();
+    let k = gram_ff.nrows();
+    let gram_reg = Mat::<f64>::identity(k, k) * lambda + gram_ff;
+    let eig_decomp = gram_reg.self_adjoint_eigen(faer::Side::Upper).unwrap();
 
-    let reconstruction = p.rb() * vc.rb();
-    let err = reconstruction.rb() - vf.rb();
-    let weighted_squared_err_norm = err.rb() * d * err.transpose();
+    let pt = eig_decomp.pseudoinverse() * gf;
+    let p = pt.transpose();
 
-    (p.to_owned(), weighted_squared_err_norm)
+    if validate_weights(p.rb(), min_abs, min_rel) {
+        Some((p.to_owned(), eval_err(gram_ff.rb(), p.rb(), gf, btb)))
+    } else {
+        None
+    }
 }
 
+fn constrained_subset_qp(
+    gram_ff: MatRef<f64>,
+    gf: ColRef<f64>,
+    btb: f64,
+) -> Option<(Row<f64>, f64)> {
+    let r = gram_ff.nrows();
+
+    let feas_tol = 1e-12;
+    let min_abs = 1e-10;
+    let min_rel = 1e-2;
+
+    // ---------- Candidate A (sum constraint inactive)
+    if let Ok(eig) = gram_ff.self_adjoint_eigen(faer::Side::Upper) {
+        let pt = eig.pseudoinverse() * gf; // r x 1
+        let p = pt.transpose(); // 1 x r
+
+        if validate_weights_constrained(p, min_abs, min_rel, feas_tol) {
+            return Some((p.to_owned(), eval_err(gram_ff.rb(), p.rb(), gf, btb)));
+        }
+    }
+
+    // ---------- Candidate B (sum constraint active: sum(p)=1)
+    let n = r + 1;
+
+    // KKT = [[G, 1], [1^T, 0]]
+    let mut kkt = Mat::<f64>::ones(n, n);
+    kkt.submatrix_mut(0, 0, r, r).copy_from(gram_ff);
+    kkt[(r, r)] = 0.0;
+
+    let mut rhs = Col::<f64>::ones(n);
+    rhs.subrows_mut(0, r).copy_from(gf);
+
+    let decomp = faer::linalg::solvers::Lblt::new(kkt.as_ref(), faer::Side::Upper);
+    let mut sol = rhs;
+    decomp.solve_in_place(sol.as_mut());
+
+    let pt = sol.subrows(0, r).to_owned();
+    let p = pt.transpose();
+
+    if validate_weights_constrained(p, min_abs, min_rel, feas_tol) {
+        return Some((p.to_owned(), eval_err(gram_ff.rb(), p.rb(), gf, btb)));
+    }
+
+    None
+}
+
+fn ls_interp_weights(
+    vf: RowRef<f64>,
+    vc: MatRef<f64>, // L x k (rows are candidate C-points)
+    d: DiagRef<f64>, // k x k (Q)
+    max_interp: usize,
+    gamma: Option<f64>,
+    mode: InterpMode,
+) -> LsInterpResult {
+    let k = vf.ncols();
+    let l = vc.nrows();
+
+    assert_eq!(k, vc.ncols(), "vf and vc k mismatch");
+    assert_eq!(k, d.nrows(), "weight matrix wrong size");
+    assert_eq!(k, d.ncols(), "weight matrix wrong size");
+
+    let local_max = l.min(max_interp);
+
+    // gram = V Q V^T, g = V Q vf^T, btb = vf Q vf^T
+    let vc_d = vc.rb() * d.rb(); // l x k
+    let gram = vc_d.rb() * vc.transpose(); // l x l
+    let g = vc_d.rb() * vf.transpose(); // l x 1
+    let btb = vf.rb() * d.rb() * vf.transpose();
+
+    // best accepted interpolation (set / weights / error)
+    let mut accepted = LsInterpResult::empty(btb);
+
+    for r in 1..=local_max {
+        // best interpolation of size `r`
+        let mut best_r: Option<LsInterpResult> = None;
+
+        for idx in (0..l).combinations(r) {
+            let (gram_ff, gf) = extract_gram_rhs(gram.as_ref(), g.rb(), &idx);
+
+            let cand = match mode {
+                InterpMode::Constrained => {
+                    constrained_subset_qp(gram_ff.as_ref(), gf.as_ref(), btb)
+                }
+                InterpMode::Regularized => {
+                    weighted_least_squares(gram_ff.as_ref(), gf.as_ref(), btb)
+                }
+            }
+            .map(|(w, err)| LsInterpResult {
+                weights: w,
+                set: idx.clone(),
+                err,
+            });
+
+            if let Some(cand) = cand {
+                match &best_r {
+                    None => best_r = Some(cand),
+                    Some(best) => {
+                        if cand.err < best.err {
+                            best_r = Some(cand);
+                        }
+                    }
+                }
+            }
+        }
+
+        // if no candidate of size r exists, continue to next size
+        let Some(best_r) = best_r else { continue };
+
+        // acceptance rule relative to currently accepted solution
+        let accept = match gamma {
+            None => best_r.err < accepted.err,
+            Some(gam) => {
+                let dr = (best_r.size() - accepted.size()) as f64;
+                best_r.err < accepted.err.powf(gam * dr)
+            }
+        };
+
+        if accept {
+            accepted = best_r;
+        }
+    }
+
+    accepted
+}
+
+#[derive(Debug, Clone)]
+pub struct CoarseFineSplit {
+    c_points: Vec<usize>,
+}
+
+impl CoarseFineSplit {
+    pub fn new(c_points: Vec<usize>) -> Self {
+        assert!(c_points.is_sorted(), "`c_points` should be sorted");
+        Self { c_points }
+    }
+    pub fn coarse_idx(&self, fine_idx: usize) -> Option<usize> {
+        self.c_points.binary_search(&fine_idx).ok()
+    }
+
+    pub fn fine_idx(&self, coarse_idx: usize) -> usize {
+        self.c_points[coarse_idx]
+    }
+
+    pub fn c_points(&self) -> &Vec<usize> {
+        &self.c_points
+    }
+
+    pub fn into_c_points(self) -> Vec<usize> {
+        self.c_points
+    }
+}
+
+/* TODO: create config / builder pattern for interpolation (least squares or aggregation based)
+*
+* LS config options:
+* - depth / depth_ls
+* - constrained / regularized
+* - max_interp
+* - tau
+*
+* - CR sub-options:
+*   - sigma func?
+*   - CR smoother
+*   - target convergence
+*   - relax steps
+*/
 pub fn least_squares(
-    fine_mat: SparseRowMatRef<usize, f64>,
-    partition: &Partition,
-    block_size: usize,
+    fine_mat: SparseMatOp,
+    smoother_partition: Arc<Partition>,
+    // TODO:? block_size: usize,
     near_null: MatRef<f64>,
     nn_weights: Vec<f64>,
 ) -> (
@@ -159,145 +355,158 @@ pub fn least_squares(
     SparseRowMat<usize, f64>,
     SparseRowMat<usize, f64>,
     SparseRowMat<usize, f64>,
+    PartitionType,
 ) {
-    let _ = block_size;
-    let n_fine = fine_mat.nrows();
-    let n_coarse = partition.aggregates().len();
+    //let _ = block_size;
+    let matref = fine_mat.mat_ref();
+    let n_fine = matref.nrows();
     let k = near_null.ncols();
-
-    let mut w_string = String::new();
-
-    let mut weights = Col::zeros(k);
-    //for (w, nn) in weights.iter_mut().zip(near_null.col_iter()) {
-    for (w, nnw) in weights.iter_mut().zip(nn_weights.iter()) {
-        /*
-        let rhs = fine_mat.rb() * nn;
-        *w = (nn.transpose() * rhs.rb()).recip().sqrt();
-        */
-        *w = nnw.sqrt();
-        w_string = format!("{} {:.2}", w_string, w);
+    let d = Col::from_iter(nn_weights.iter().copied().take(near_null.ncols())).into_diagonal();
+    let mut u0 = Col::zeros(n_fine);
+    for col in near_null.col_iter() {
+        u0 += col;
     }
-    info!("nn weigts: {}", w_string);
-    let d = weights.into_diagonal();
-    //let d = Col::from_iter(w.column_vector().iter().map(|weight| weight.sqrt())).into_diagonal();
-    //let d = Diag::ones(k);
-    let centers: Vec<usize> = partition
-        .aggregates()
-        .iter()
-        //.map(|agg| best_coarse(agg, near_null, w.rb()).0)
-        .map(|agg| best_coarse(agg, near_null, d.rb()).0)
-        .collect();
-    let mut coarse_graph = AdjacencyList::new_ls_strength_graph(fine_mat, near_null);
-    coarse_graph.aggregate(partition);
+    let par = get_global_parallelism();
 
+    let depth = 3;
+    let strength_graph =
+        AdjacencyList::new_ls_strength_graph(matref, near_null, &nn_weights, depth);
+
+    let mut reduction_factor = 1.0;
+    let target_reduction = 0.15;
+    let relax_steps = 5;
+    let mut c_points = BTreeSet::new();
+    #[derive(Copy, Clone, PartialEq, Eq, Debug)]
+    enum PointType {
+        F,
+        C,
+        N,
+    }
+    let mut partition = vec![PointType::F; n_fine];
+
+    let mut cr_iter = 1;
+    while reduction_factor > target_reduction {
+        let mut f_points: Vec<bool> = partition.iter().map(|p| *p == PointType::F).collect();
+        let new_c_points = strength_graph.maximal_independent_set(&mut f_points);
+        for c_point in new_c_points.iter() {
+            assert_eq!(partition[*c_point], PointType::F);
+            partition[*c_point] = PointType::C;
+        }
+        c_points.extend(new_c_points);
+        let identity_f = Col::from_iter(partition.iter().map(|point_type| match point_type {
+            PointType::C => 0.0,
+            _ => 1.0,
+        }))
+        .into_diagonal();
+        let u0f = identity_f.rb() * u0.rb();
+        let start_norm = u0f.norm_l2();
+        let mut unuf = u0f.clone();
+        let mut af = identity_f.rb() * matref * identity_f.rb();
+        for (i, point_type) in partition.iter().copied().enumerate() {
+            if point_type == PointType::C {
+                *af.get_mut(i, i).unwrap() = 1.0;
+            }
+        }
+        let af = SparseMatOp::new(af, 1, par);
+        // TODO: should abstract to `fn SparseMatOp -> Precond<f64>` instead of passing in
+        // partition for use of any smoother in API
+        let mf = BlockSmootherConfig::default()
+            .build_from_partition(af.clone(), smoother_partition.clone());
+
+        let iteration = ErrorPropogator {
+            op: af.dyn_op(),
+            pc: Arc::new(mf),
+        };
+        let stack_req = iteration.apply_in_place_scratch(unuf.ncols(), par);
+        let mut buf = MemBuffer::new(stack_req);
+        let stack = MemStack::new(&mut buf);
+
+        for _ in 0..relax_steps {
+            iteration.apply_in_place(unuf.as_mat_mut(), par, stack);
+        }
+        let end_norm = unuf.norm_l2();
+        reduction_factor = (end_norm / start_norm).powf(1. / relax_steps as f64);
+        trace!(
+            "CR iter {}, {} c-points, {:.2} reduction factor\n\t{:.2e} start norm and {:.2e} end norm",
+            cr_iter,
+            c_points.len(),
+            reduction_factor,
+            start_norm,
+            end_norm
+        );
+        let tol = 1.0 - reduction_factor;
+        let inf_norm = unuf.norm_max();
+        for i in 0..n_fine {
+            let sigma_i = unuf[i].abs() / inf_norm;
+            if sigma_i > tol {
+                partition[i] = PointType::F;
+            } else if partition[i] == PointType::F {
+                partition[i] = PointType::N;
+            }
+        }
+        cr_iter += 1;
+    }
+    info!(
+        "Compatible Relaxation completed in {} iters with {} c-points",
+        cr_iter,
+        c_points.len()
+    );
+
+    let n_coarse = c_points.len();
     let max_interp = 3;
-    let mut vc = Mat::zeros(max_interp, k);
     let mut p_triplets = Vec::new();
+    let d_ls = depth + 2;
+    let tau = 1.2;
 
-    for ((agg, neighborhood), (coarse_id, center)) in partition
-        .aggregates()
+    let mut coarse_near_null = Mat::zeros(c_points.len(), k);
+    for ((coarse_idx, c_point), mut coarse_row) in c_points
         .iter()
-        .zip(coarse_graph.nodes().iter())
-        .zip(centers.iter().copied().enumerate())
+        .enumerate()
+        .zip(coarse_near_null.row_iter_mut())
     {
-        /*
-        let mut vf = Mat::zeros(agg.len(), k);
-        for (node_id, mut local_row) in agg.iter().zip(vf.row_iter_mut()) {
-            local_row.copy_from(near_null.row(*node_id));
-        }
-        */
-
-        for f_point in agg.iter().copied() {
-            if f_point == center {
-                // we are a c point not an f point
-                p_triplets.push(Triplet::new(center, coarse_id, 1.0));
-                continue;
-            }
-            let vf = near_null.row(f_point);
-            // key: coarse_id, value: row of `vc` / col of `best_weights`
-            let mut interp_points: BTreeMap<usize, usize> = BTreeMap::new();
-            interp_points.insert(coarse_id, 0);
-            vc.row_mut(0).copy_from(near_null.row(center));
-            let (local_p, error) = weighted_least_squares(d.rb(), vc.subrows(0, 1), vf.rb());
-            let mut best_weights = local_p;
-            let mut prev_best_err = f64::MAX;
-            let mut best_err = error;
-
-            for n_interp in 1..max_interp {
-                //.min(agg.len() - 1) {
-                let mut best_coarse_id = None;
-                for (coarse_id, _strength) in neighborhood.iter().copied() {
-                    let c_point = centers[coarse_id];
-                    if interp_points.contains_key(&coarse_id) {
-                        continue;
-                    }
-                    vc.row_mut(n_interp).copy_from(near_null.row(c_point));
-                    let (local_p, error) =
-                        weighted_least_squares(d.rb(), vc.subrows(0, n_interp + 1), vf.rb());
-                    //assert!(error < prev_best_err, "with more interp points error should be improving... previous best: {} current: {}", prev_best_err, error);
-                    if error < best_err {
-                        best_coarse_id = Some(coarse_id);
-                        best_err = error;
-                        best_weights = local_p;
-                    }
-                }
-                if best_err > 1.0 {
-                    warn!(
-                        "extremelly high local interpolation error: {:.2} with {} points",
-                        best_err, n_interp
-                    );
-                }
-                /*
-                if best_err > prev_best_err.powf(1.2) {
-                    break;
-                }
-                */
-                match best_coarse_id {
-                    Some(coarse_id) => {
-                        let c_point = centers[coarse_id];
-                        vc.row_mut(n_interp).copy_from(near_null.row(c_point));
-                        interp_points.insert(coarse_id, n_interp);
-                        prev_best_err = best_err;
-                    }
-                    None => {
-                        // this could happen if there aren't many coarse neighbors, we should always at
-                        // least have our center, though
-                        //warn!("didn't improve at {} interpolation points...", n_interp);
-                        break;
-                    }
-                }
-            }
-
-            if true {
-                let n_points = interp_points.len();
-                let p = best_weights.subcols(0, n_points);
-                let vc = vc.subrows(0, n_points);
-                let vf = near_null.row(f_point);
-                let err = vf - p * vc;
-                if p.max().unwrap().abs() > 2.0 {
-                    warn!("Large interpolation weight computed in LS:\nerr:\n{:?}\nvf:\n{:?}\np:\n{:?}\nvc:\n{:?}", err, vf, p, vc);
-                }
-            }
-            for (coarse_id, p_idx) in interp_points.iter() {
-                let weight = best_weights[*p_idx];
-                p_triplets.push(Triplet::new(f_point, *coarse_id, weight));
-            }
-
-            /*
-            assert_eq!(interp_points.len(), best_weights.ncols());
-            assert_eq!(agg.len(), best_weights.nrows());
-            for (fine_point, weights) in agg.iter().zip(best_weights.row_iter()) {
-                for (coarse_id, weight) in interp_points.iter().zip(weights.iter()) {
-                    p_triplets.push(Triplet::new(*fine_point, *coarse_id, *weight));
-                }
-            }
-            */
-        }
+        coarse_row.copy_from(near_null.row(*c_point));
+        p_triplets.push(Triplet::new(*c_point, coarse_idx, 1.0));
     }
 
-    let mut coarse_near_null = Mat::zeros(centers.len(), k);
-    for (c_point, mut coarse_row) in centers.iter().zip(coarse_near_null.row_iter_mut()) {
-        coarse_row.copy_from(near_null.row(*c_point));
+    let interp_data: Vec<(usize, Row<f64>, Vec<usize>)> = (0..n_fine)
+        .into_par_iter()
+        .filter(|i| partition[*i] != PointType::C)
+        .map(|i| {
+            let mut local = extract_local_subgraph(matref.symbolic(), i, d_ls);
+            local.retain(|j| partition[*j] == PointType::C);
+            let c_point_local_to_global: Vec<usize> = local.iter().copied().collect();
+            let vf = near_null.row(i);
+            let l = local.len();
+            let mut vc = Mat::zeros(l, k);
+            for (mut row, j) in vc.row_iter_mut().zip(local.iter().copied()) {
+                row.copy_from(near_null.row(j));
+            }
+
+            let res = ls_interp_weights(
+                vf,
+                vc.as_ref(),
+                d.as_ref(),
+                max_interp,
+                Some(tau),
+                InterpMode::Constrained,
+            );
+
+            (
+                i,
+                res.weights,
+                res.set
+                    .into_iter()
+                    .map(|local_i| c_point_local_to_global[local_i])
+                    .collect(),
+            )
+        })
+        .collect();
+
+    let partition = CoarseFineSplit::new(c_points.into_iter().collect());
+    for (i, best_p, best_set) in interp_data {
+        for (p_ij, fine_j) in best_p.iter().copied().zip(best_set) {
+            p_triplets.push(Triplet::new(i, partition.coarse_idx(fine_j).unwrap(), p_ij));
+        }
     }
 
     let p = SparseRowMat::try_new_from_triplets(n_fine, n_coarse, &p_triplets)
@@ -309,13 +518,19 @@ pub fn least_squares(
         .transpose()
         .to_row_major()
         .expect("failed to transpose interp to form restriction");
-    let mat_coarse = &r * &(fine_mat * &p);
-    (coarse_near_null, r, p, mat_coarse)
+    let mat_coarse = &r * &(matref * &p);
+    (
+        coarse_near_null,
+        r,
+        p,
+        mat_coarse,
+        PartitionType::Classical(Arc::new(partition)),
+    )
 }
 
 pub fn smoothed_aggregation(
     fine_mat: SparseRowMatRef<usize, f64>,
-    partition: &Partition,
+    partition: Arc<Partition>,
     block_size: usize,
     near_null: MatRef<f64>,
 ) -> (
@@ -323,6 +538,7 @@ pub fn smoothed_aggregation(
     SparseRowMat<usize, f64>,
     SparseRowMat<usize, f64>,
     SparseRowMat<usize, f64>,
+    PartitionType,
 ) {
     let n_fine = fine_mat.nrows();
     let n_coarse = partition.aggregates().len();
@@ -361,11 +577,6 @@ pub fn smoothed_aggregation(
             */
         }
 
-        /*
-        let qr = local.qr();
-        let q = qr.compute_thin_Q();
-        let r = qr.thin_R();
-        */
         let svd = local.thin_svd().unwrap();
         let q = svd.U();
         let s = svd.S();
@@ -421,7 +632,13 @@ pub fn smoothed_aggregation(
         .to_row_major()
         .expect("failed to transpose SA interp to form restriction");
     let mat_coarse = &r * &(fine_mat * &p);
-    (coarse_near_null, r, p, mat_coarse)
+    (
+        coarse_near_null,
+        r,
+        p,
+        mat_coarse,
+        PartitionType::Aggregation(partition),
+    )
 }
 
 fn csr_block_smoother(

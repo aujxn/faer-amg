@@ -32,6 +32,11 @@ impl SmootherKind {
     }
 }
 
+/*
+pub struct SymGaussSeidel {
+}
+*/
+
 pub type L2 = Diag<f64>;
 pub type L1 = Diag<f64>;
 

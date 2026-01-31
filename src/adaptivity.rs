@@ -8,6 +8,7 @@ use faer::linalg::temp_mat_scratch;
 use faer::mat::AsMatRef;
 use faer::matrix_free::{BiLinOp, BiPrecond, LinOp, Precond};
 use faer::prelude::{Reborrow, ReborrowMut};
+use faer::sparse::SparseRowMatRef;
 use faer::stats::prelude::StandardNormal;
 use faer::stats::{CwiseMatDistribution, DistributionExt};
 use faer::{get_global_parallelism, Col, ColRef, Mat, MatMut, MatRef, Par};
@@ -55,38 +56,63 @@ impl AdaptiveConfig {
     }
 
     pub fn build(&self, mat: SparseMatOp) -> Composite {
-        let l1_diag = Arc::new(new_l1(mat.mat_ref()));
-        let oversample = 5;
-        let par = get_global_parallelism();
+        let nn = find_near_null(
+            mat.clone(),
+            self.test_iters,
+            self.coarsening_near_null_dim - 1,
+            self.multigrid_config
+                .smoother_config
+                .partitioner_config
+                .coarsening_factor,
+        );
+        let mut nn_with_constant = Mat::ones(nn.nrows(), self.coarsening_near_null_dim);
+        nn_with_constant
+            .subcols_mut(1, self.coarsening_near_null_dim - 1)
+            .copy_from(nn);
+        let basis = nn_with_constant.qr().compute_thin_Q();
+        let weights = create_weights(basis.as_mat_ref(), mat.mat_ref());
+        print!("\nnn weight: ");
+        for w in weights.iter() {
+            print!("{:.2} ", w);
+        }
+        println!();
 
+        /*
         let (smoothed, mut cfs) = smooth_vector(
             mat.clone(),
             l1_diag.clone(),
             self.test_iters,
-            //self.coarsening_near_null_dim - 1,
-            self.coarsening_near_null_dim,
+            self.coarsening_near_null_dim - 1,
+            //self.coarsening_near_null_dim,
             false,
         );
 
-        /*
         let mut with_constant = Mat::ones(smoothed.nrows(), self.coarsening_near_null_dim);
         with_constant
             .subcols_mut(1, self.coarsening_near_null_dim - 1)
             .copy_from(smoothed);
         let basis = with_constant.qr().compute_thin_Q();
-        */
-        let basis = smoothed;
+        //let basis = smoothed;
 
         print!("||Ev||_A^(1/cycles): ");
+        let first = (1. - cfs[0]).recip() * 0.1;
         cfs.iter_mut().for_each(|reduction| {
-            print!("{:.3} ", reduction);
-            *reduction = (1. - *reduction).recip();
+            print!("{:.2} ", reduction);
+            *reduction = (1. - *reduction).recip() / first;
         });
+        //println!();
+        print!("\nnn weight: ");
+        for w in cfs.iter() {
+            print!("{:.2} ", w);
+        }
         println!();
+        */
+
         let initial_near_null = Arc::new(basis);
-        let initial_hierarchy =
-            self.hierarchy_config
-                .build(mat.clone(), initial_near_null, Some(cfs));
+        let initial_hierarchy = self
+            .hierarchy_config
+            //.build(mat.clone(), initial_near_null, Some(cfs));
+            .build(mat.clone(), initial_near_null, Some(weights));
         info!("Hierarchy 1 info:\n{:?}", initial_hierarchy);
         let first_component = self.multigrid_config.build(initial_hierarchy);
         let mut composite = Composite::new(mat.dyn_op(), Arc::new(first_component));
@@ -98,25 +124,41 @@ impl AdaptiveConfig {
             );
 
             let arc_comp = Arc::new(composite.clone());
-            let (smoothed, mut cfs) = smooth_vector(
+            let (smoothed, cfs) = smooth_vector(
                 mat.clone(),
                 arc_comp,
-                self.test_iters,
+                self.test_iters / (2 * n_components - 1),
                 self.coarsening_near_null_dim,
                 false,
             );
             let n_vcycles = (n_components * 2 - 1) as f64;
             print!("||Ev||_A^(1/cycles): ");
-            cfs.iter_mut().for_each(|reduction| {
+            //let first = (1. - cfs[0].powf(n_vcycles.recip())).recip() * 0.1;
+            cfs.iter().for_each(|reduction| {
                 let cf_per_cycle = reduction.powf(n_vcycles.recip());
-                print!("{:.3} ", cf_per_cycle);
-                *reduction = (1. - cf_per_cycle).recip();
+                print!("{:.2} ", cf_per_cycle);
+                //*reduction = (1. - cf_per_cycle).recip() / first;
             });
             println!();
+            /*
+            print!("nn weight: ");
+            for w in cfs.iter() {
+                print!("{:.2} ", w);
+            }
+            println!();
+            let weights = create_weights(smoothed.as_ref(), mat.mat_ref());
+            print!("\nnn weight: ");
+            for w in weights.iter() {
+                print!("{:.2} ", w);
+            }
+            println!();
+            */
+
             let near_null = Arc::new(smoothed);
             let hierarchy = self
                 .hierarchy_config
                 .build(mat.clone(), near_null, Some(cfs));
+            //.build(mat.clone(), near_null, Some(weights));
             info!("Hierarchy {} info:\n{:?}", n_components + 1, hierarchy);
             let component = self.multigrid_config.build(hierarchy);
             composite.push(Arc::new(component));
@@ -226,7 +268,7 @@ pub fn find_near_null(
     mat: SparseMatOp,
     iterations: usize,
     near_null_dim: usize,
-    smoothing_block_size: usize,
+    smoothing_block_size: f64,
 ) -> Mat<f64> {
     let simple_pc = new_l1(mat.mat_ref());
     let (smooth_basis, _) = smooth_vector(
@@ -238,7 +280,7 @@ pub fn find_near_null(
     );
 
     let partitioner_config = PartitionerConfig {
-        coarsening_factor: smoothing_block_size as f64,
+        coarsening_factor: smoothing_block_size,
         max_improvement_iters: 50,
         ..Default::default()
     };
@@ -246,14 +288,22 @@ pub fn find_near_null(
         partitioner_config,
         ..Default::default()
     };
-    let block_pc = block_smoother_config.build(mat.clone(), Arc::new(smooth_basis));
-    let (smooth_basis, _) = smooth_vector(
+    let weights = create_weights(smooth_basis.as_mat_ref(), mat.mat_ref());
+    let block_pc = block_smoother_config.build(mat.clone(), Arc::new(smooth_basis), Some(&weights));
+    let (smooth_basis, cfs) = smooth_vector(
         mat.clone(),
         Arc::new(block_pc),
         iterations,
         near_null_dim,
         false,
     );
+
+    print!("||Ev||_A^(1/cycles): ");
+    cfs.iter().for_each(|reduction| {
+        print!("{:.2} ", reduction);
+    });
+    println!();
+
     smooth_basis
 }
 
@@ -274,7 +324,8 @@ fn smooth_vector(
     let rng = &mut rng();
     let mut x = CwiseMatDistribution {
         nrows: n,
-        ncols: near_null_dim * 2,
+        //ncols: near_null_dim * 2,
+        ncols: near_null_dim,
         dist: StandardNormal,
     }
     .rand::<Mat<f64>>(rng);
@@ -284,6 +335,7 @@ fn smooth_vector(
     let stack_req = iteration.apply_in_place_scratch(x.ncols(), par);
     let mut buf = MemBuffer::new(stack_req);
     let stack = MemStack::new(&mut buf);
+    /*
     let start = Instant::now();
     info!("Starting search for smooth vectors");
     let pre_smooth_iters = iterations.saturating_sub(5);
@@ -295,6 +347,8 @@ fn smooth_vector(
         "{:.2e} secs per error prop iter",
         duration.as_secs_f64() / pre_smooth_iters as f64
     );
+    */
+    let start = Instant::now();
     x = x.qr().compute_thin_Q();
 
     for _ in 0..iterations {
@@ -379,3 +433,14 @@ fn smooth_vector(
     (x.qr().compute_thin_Q(), Diag::zeros(x.nrows()))
 }
 */
+
+fn create_weights(nn_basis: MatRef<f64>, mat: SparseRowMatRef<usize, f64>) -> Vec<f64> {
+    nn_basis
+        .col_iter()
+        .map(|v| {
+            let av = mat.rb() * v.rb();
+            let vtav = v.transpose() * av;
+            vtav.recip()
+        })
+        .collect()
+}

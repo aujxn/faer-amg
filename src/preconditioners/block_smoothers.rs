@@ -5,6 +5,8 @@ use std::{
 
 use faer::{
     dyn_stack::{MemBuffer, MemStack, StackReq},
+    get_global_parallelism,
+    mat::AsMatMut,
     matrix_free::{BiLinOp, BiPrecond, LinOp, Precond},
     prelude::{Reborrow, ReborrowMut},
     sparse::{SparseRowMat, SparseRowMatRef, Triplet},
@@ -53,7 +55,12 @@ impl BlockSmootherConfig {
         Self::default()
     }
 
-    pub fn build(&self, base_matrix: SparseMatOp, near_null: Arc<Mat<f64>>) -> BlockSmoother {
+    pub fn build(
+        &self,
+        base_matrix: SparseMatOp,
+        near_null: Arc<Mat<f64>>,
+        nn_weights: Option<&Vec<f64>>,
+    ) -> BlockSmoother {
         /*
         let mut partition_config = self.partitioner_config.clone();
         let n_levels = 4;
@@ -64,9 +71,9 @@ impl BlockSmootherConfig {
             partitioner_configs: vec![partition_config; n_levels],
         };
         */
-        let partition = self
-            .partitioner_config
-            .build_partition(base_matrix.clone(), near_null);
+        let partition =
+            self.partitioner_config
+                .build_partition(base_matrix.clone(), near_null, nn_weights);
         BlockSmoother::new(base_matrix, Arc::new(partition), self.block_smoother_kind)
     }
 
@@ -143,6 +150,29 @@ impl BlockSmoother {
             dim: mat.nrows(),
             vdim,
         }
+    }
+
+    pub fn into_sparse_mat(&self) -> SparseRowMat<usize, f64> {
+        let mut p_triplets = Vec::new();
+
+        // TODO: use actual stack once implemented
+        let mut buf = MemBuffer::new(StackReq::new::<i32>(0));
+        let stack = MemStack::new(&mut buf);
+        // could also rayon over loop instead of this maybe better?
+        let par = get_global_parallelism();
+
+        for (agg, block_solver) in self.partition.aggregates().iter().zip(self.blocks.iter()) {
+            let block_size = agg.len();
+            let mut block_inverse: Mat<f64> = Mat::identity(block_size, block_size);
+            block_solver.apply_in_place(block_inverse.as_mat_mut(), par, stack);
+            for (row, row_inv) in agg.iter().copied().zip(block_inverse.row_iter()) {
+                for (col, val) in agg.iter().copied().zip(row_inv.iter().copied()) {
+                    p_triplets.push(Triplet::new(row, col, val));
+                }
+            }
+        }
+
+        SparseRowMat::try_new_from_triplets(self.dim, self.dim, &p_triplets).unwrap()
     }
 }
 

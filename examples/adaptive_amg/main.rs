@@ -6,9 +6,8 @@ use faer::{
     dyn_stack::{MemBuffer, MemStack, StackReq},
     get_global_parallelism,
     matrix_free::{
-        conjugate_gradient::{
-            conjugate_gradient, conjugate_gradient_scratch, CgError, CgInfo, CgParams,
-        },
+        conjugate_gradient::{conjugate_gradient, conjugate_gradient_scratch},
+        stationary_iteration::{stationary_iteration, stationary_iteration_scratch},
         IdentityPrecond, LinOp, Precond,
     },
     prelude::ReborrowMut,
@@ -17,16 +16,19 @@ use faer::{
         prelude::StandardNormal, CwiseColDistribution, CwiseMatDistribution, DistributionExt,
         UnitaryMat,
     },
-    Col, Mat, MatRef, Par,
+    Col, ColRef, Mat, MatRef, Par,
 };
 use faer_amg::{
     adaptivity::{AdaptiveConfig, ErrorPropogator},
     core::SparseMatOp,
     decompositions::rand_svd::rand_svd,
     hierarchy::HierarchyConfig,
+    par_spmm::ParSpmmOp,
     partitioners::{modularity::Partitioner, PartitionerCallback, PartitionerConfig},
-    preconditioners::{block_smoothers::BlockSmootherConfig, multigrid::MultigridConfig},
-    utils::load_mfem_linear_system,
+    preconditioners::{
+        block_smoothers::BlockSmootherConfig, composite::Composite, multigrid::MultigridConfig,
+    },
+    utils::{load_mfem_linear_system, test_solver},
 };
 use log::{info, warn, LevelFilter};
 use rand::{rngs::StdRng, SeedableRng};
@@ -186,7 +188,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     let multigrid_config = MultigridConfig {
         smoother_config,
-        smoothing_steps: 2,
+        smoothing_steps: 3,
         ..Default::default()
     };
 
@@ -200,108 +202,80 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     let mut composite = adaptive_config.build(base_mat.clone());
 
-    let par_op = base_mat.par_op().unwrap() as Arc<dyn LinOp<f64> + Send>;
-    let arc_pc = Arc::new(composite.clone());
+    let par_op = base_mat.par_op().unwrap() as Arc<dyn LinOp<f64> + Send + Sync>;
 
-    info!(
-        "Running PCG solve with tolerance {:.2e} and max {} iterations",
-        cli.tolerance, cli.max_iters
-    );
-    let rhs_vec: Col<f64> = rhs_full.col(0).to_owned();
-
-    let rng = &mut StdRng::seed_from_u64(42);
-    let initial_guess = CwiseColDistribution {
-        nrows: rhs_full.nrows(),
-        dist: StandardNormal,
-    }
-    .rand::<Col<f64>>(rng);
-
-    let params = CgParams {
-        abs_tolerance: 0.0,
-        rel_tolerance: cli.tolerance,
-        max_iters: cli.max_iters,
-        initial_guess: faer::matrix_free::InitialGuessStatus::MaybeNonZero,
-        ..Default::default()
-    };
-
-    let results = run_composite_pcg(
+    let results = test_composite(
         &mut composite,
-        base_mat,
-        rhs_vec.as_mat(),
-        &initial_guess,
-        params,
-        par,
-    )?;
-    let table = build_results_table(&results);
-    info!("Composite PCG results:\n{table}");
+        par_op,
+        rhs_full.as_ref(),
+        cli.max_iters,
+        cli.tolerance,
+    );
+    let pcg_table = build_results_table(&results.pcg);
+    info!("Composite PCG results:\n{pcg_table}");
+    let stationary_table = build_results_table(&results.stationary);
+    info!("Composite stationary results:\n{stationary_table}");
 
     Ok(())
 }
 
 type CompositeResult = (usize, usize, usize, f64, f64, f64);
 
-fn run_composite_pcg(
+struct CompositeSolveResults {
+    pcg: Vec<CompositeResult>,
+    stationary: Vec<CompositeResult>,
+}
+
+fn test_composite(
     composite: &mut faer_amg::preconditioners::composite::Composite,
-    matrix: SparseMatOp,
+    matrix: Arc<dyn LinOp<f64> + Sync + Send>,
     rhs: MatRef<'_, f64>,
-    initial_guess: &Col<f64>,
-    params: CgParams<f64>,
-    par: Par,
-) -> Result<Vec<CompositeResult>, Box<dyn Error>> {
-    let mut results = Vec::new();
+    max_iters: usize,
+    tolerance: f64,
+) -> CompositeSolveResults {
+    let mut pcg_results = Vec::new();
+    let mut stationary_results = Vec::new();
+
+    let rhs_vec: ColRef<f64> = rhs.col(0);
+    let rhs = Some(rhs_vec.as_mat());
+    let rng = &mut StdRng::seed_from_u64(42);
+    let initial_guess = CwiseColDistribution {
+        nrows: rhs_vec.nrows(),
+        dist: StandardNormal,
+    }
+    .rand::<Col<f64>>(rng);
+    let initial_guess = Some(initial_guess.as_mat());
+
     while !composite.components().is_empty() {
         let component_count = composite.components().len();
         let arc_pc = Arc::new(composite.clone());
-        let stack_req =
-            conjugate_gradient_scratch(arc_pc.as_ref(), matrix.par_op().unwrap().as_ref(), 1, par);
-        let mut buf = MemBuffer::new(stack_req);
-        let stack = MemStack::new(&mut buf);
-        let mut dst = initial_guess.clone();
 
-        let result = conjugate_gradient(
-            dst.as_mut().as_mat_mut(),
-            arc_pc.as_ref(),
-            matrix.par_op().unwrap().as_ref(),
+        let ((cg_iters, cg_residual, _dst_cg), (sli_iters, sli_residual, _dst_sli)) = test_solver(
+            matrix.clone(),
+            arc_pc,
+            initial_guess,
             rhs,
-            params,
-            |_| {},
-            par,
-            stack,
+            max_iters,
+            tolerance,
         );
-
-        let info = report(result)?;
-
-        let mut residual = matrix.mat_ref() * dst.as_mat();
-        residual -= rhs;
-        let residual_norm = residual.norm_l2();
-        let rhs_norm = rhs.norm_l2();
-        let rel_residual = residual_norm / rhs_norm.max(1e-32);
-
-        let vcycles_per_iter = 2 * component_count - 1;
-        let total_vcycles = info.iter_count * vcycles_per_iter;
-        let reduction_per_iter = if info.iter_count > 0 {
-            info.rel_residual.powf(1.0 / info.iter_count as f64)
-        } else {
-            0.0
-        };
-        let reduction_per_vcycle = if total_vcycles > 0 {
-            info.rel_residual.powf(1.0 / total_vcycles as f64)
-        } else {
-            0.0
-        };
-        results.push((
+        pcg_results.push(build_composite_result(
             component_count,
-            info.iter_count,
-            total_vcycles,
-            reduction_per_iter,
-            reduction_per_vcycle,
-            rel_residual,
+            cg_iters,
+            cg_residual,
+        ));
+        stationary_results.push(build_composite_result(
+            component_count,
+            sli_iters,
+            sli_residual,
         ));
 
         composite.components_mut().pop();
     }
 
-    Ok(results)
+    CompositeSolveResults {
+        pcg: pcg_results,
+        stationary: stationary_results,
+    }
 }
 
 fn build_results_table(results: &[CompositeResult]) -> String {
@@ -332,17 +306,31 @@ fn build_results_table(results: &[CompositeResult]) -> String {
     table
 }
 
-fn report(result: Result<CgInfo<f64>, CgError<f64>>) -> Result<CgInfo<f64>, Box<dyn Error>> {
-    match result {
-        Ok(info) => {
-            info!(
-                "CG converged in {} iterations (abs {:.2e}, rel {:.2e})",
-                info.iter_count, info.abs_residual, info.rel_residual
-            );
-            Ok(info)
-        }
-        Err(err) => Err(format!("CG failed: {err:?}").into()),
-    }
+fn build_composite_result(
+    component_count: usize,
+    iter_count: usize,
+    rel_residual: f64,
+) -> CompositeResult {
+    let vcycles_per_iter = 2 * component_count - 1;
+    let total_vcycles = iter_count * vcycles_per_iter;
+    let reduction_per_iter = if iter_count > 0 {
+        rel_residual.powf(1.0 / iter_count as f64)
+    } else {
+        0.0
+    };
+    let reduction_per_vcycle = if total_vcycles > 0 {
+        rel_residual.powf(1.0 / total_vcycles as f64)
+    } else {
+        0.0
+    };
+    (
+        component_count,
+        iter_count,
+        total_vcycles,
+        reduction_per_iter,
+        reduction_per_vcycle,
+        rel_residual,
+    )
 }
 
 fn system_path(cli: &Cli) -> (PathBuf, String) {

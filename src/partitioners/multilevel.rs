@@ -15,7 +15,7 @@ impl MultilevelPartitionerConfig {
         assert!(self.partitioner_configs.len() > 1);
         let mut partitioners = Vec::new();
 
-        let partitioner = self.partitioner_configs[0].build(mat, near_null, None);
+        let partitioner = self.partitioner_configs[0].build(mat, near_null, None, None);
         partitioners.push(partitioner);
 
         for config in self.partitioner_configs.iter().skip(1) {

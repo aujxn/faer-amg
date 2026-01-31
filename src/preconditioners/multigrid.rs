@@ -79,7 +79,8 @@ impl MultigridConfig {
         for level in 0..(level_count - 1) {
             let op = hierarchy.get_op(level);
             let near_null = hierarchy.get_near_null(level);
-            let partition = partition_config.build_partition(op, near_null);
+            let partition =
+                partition_config.build_partition(op, near_null, hierarchy.get_nn_weights(level));
             smoother_partitions.push(Arc::new(partition));
             /*
             let partitions = ml_partitioner_config.build_hierarchy(op.clone(), near_null.clone());
@@ -153,7 +154,9 @@ impl MultigridConfig {
                 multigrid.add_level(spmm_op, smoother, r, p);
             }
         }
-        multigrid.with_cycle_type(self.mu)
+        multigrid
+            .with_cycle_type(self.mu)
+            .with_smoothing_steps(self.smoothing_steps)
     }
 }
 
@@ -195,7 +198,14 @@ impl Multigrid {
     /// is called a V-cycle, `mu=2` a W-cycle, and `mu > 2` a mu-cycle. Algorithmic complexity
     /// scales $O(\ell^\mu)$ where the grid has $\ell$ levels.
     pub fn with_cycle_type(mut self, mu: usize) -> Self {
+        assert!(mu > 0);
         self.cycle_type = mu;
+        self
+    }
+
+    pub fn with_smoothing_steps(mut self, steps: usize) -> Self {
+        assert!(steps > 0);
+        self.smoothing_steps = steps;
         self
     }
 

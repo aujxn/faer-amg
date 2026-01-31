@@ -4,23 +4,27 @@ use faer::{
     mat::AsMatMut,
     matrix_free::{LinOp, Precond},
     sparse::{SparseRowMat, SparseRowMatRef},
-    Mat,
+    Col, Mat,
 };
 use log::info;
 use std::{fmt, sync::Arc};
 
 use crate::{
-    adaptivity::{find_near_null, smooth_vector_rand_svd},
+    adaptivity::{find_near_null, smooth_vector_rand_svd, ErrorPropogator},
     core::SparseMatOp,
-    interpolation::{least_squares, smoothed_aggregation},
+    interpolation::{least_squares, smoothed_aggregation, CoarseFineSplit},
     par_spmm::ParSpmmOp,
     partitioners::{
         multilevel::MultilevelPartitionerConfig, Partition, PartitionStats, PartitionerConfig,
     },
-    preconditioners::smoothers::{new_l1, StationaryIteration},
+    preconditioners::{
+        block_smoothers::BlockSmootherConfig,
+        smoothers::{new_l1, StationaryIteration},
+    },
     utils::{matrix_stats, write_matrix_stats_table, MatrixStats, NdofsFormat},
 };
 
+// TODO: add interpolation config once implemented
 #[derive(Debug, Clone)]
 pub struct HierarchyConfig {
     pub coarsest_dim: usize,
@@ -55,12 +59,18 @@ impl HierarchyConfig {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum PartitionType {
+    Aggregation(Arc<Partition>),
+    Classical(Arc<CoarseFineSplit>),
+}
+
 #[derive(Clone)]
 pub struct Hierarchy {
     operators: Vec<SparseMatOp>,
     restrictions: Vec<Arc<SparseRowMat<usize, f64>>>,
     interpolations: Vec<Arc<SparseRowMat<usize, f64>>>,
-    partitions: Vec<Arc<Partition>>,
+    partitions: Vec<PartitionType>,
     near_nulls: Vec<Arc<Mat<f64>>>,
     nn_weights: Option<Vec<f64>>,
     candidates: Vec<Arc<Mat<f64>>>,
@@ -153,13 +163,16 @@ impl fmt::Debug for Hierarchy {
             )?;
         }
 
+        /* TODO: handle both variants of `PartitionType`, this only does `partitioners::Partition`
         if !self.partitions.is_empty() {
             writeln!(f)?;
             let partition_stats: Vec<_> = self.partitions.iter().map(|p| p.info()).collect();
             write_partition_stats_table(f, "Partition summary", &partition_stats)?;
         }
+        */
 
         writeln!(f, "Operator complexity: {:.3}", self.op_complexity())?;
+        writeln!(f, "Grid complexity: {:.3}", self.grid_complexity())?;
         Ok(())
     }
 }
@@ -185,128 +198,71 @@ impl Hierarchy {
         }
     }
 
-    /*
-    fn coarsen2(&mut self) {
-        let candidate_dim = self.config.interp_candidate_dim as f64;
-        let coarsest_dim = self.config.coarsest_dim;
-        let cf = self.config.partitioner_config.coarsening_factor;
-
-        let mut level = 0;
-
-        let n_candidates = self.config.interp_candidate_dim;
-        loop {
-            let current_op = self.get_op(level);
-            if current_op.mat_ref().nrows() < coarsest_dim {
-                break;
-            }
-            let (coarsen_near_null, partitioner_conf) = if level == 0 {
-                let coarsen_near_null = self.get_near_null(level);
-                let fine_block_size = current_op.block_size() as f64;
-                let ratio = candidate_dim / fine_block_size;
-                let first_cf = cf * ratio;
-                let mut first_partitioner_conf = self.config.partitioner_config.clone();
-                first_partitioner_conf.coarsening_factor = first_cf;
-                (coarsen_near_null, first_partitioner_conf)
-            } else {
-                let coarsen_near_null = smooth_vector_rand_svd(current_op.clone(), 100, 128);
-                let coarsen_near_null = Arc::new(coarsen_near_null);
-                self.near_nulls.push(coarsen_near_null.clone());
-                (coarsen_near_null, self.config.partitioner_config.clone())
-            };
-            let interp_near_null = self.candidates[level].clone();
-            let partition =
-                partitioner_conf.build_partition(current_op.clone(), coarsen_near_null.clone());
-            partition.validate();
-
-            let par = get_global_parallelism();
-
-            let (mut coarse_near_null, restriction_mat, interpolation_mat, coarse_mat) =
-                smoothed_aggregation(
-                    current_op.mat_ref(),
-                    &partition,
-                    current_op.block_size(),
-                    interp_near_null.as_ref().as_ref(),
-                );
-
-            let coarse_op = SparseMatOp::new(coarse_mat, n_candidates, par);
-            let l1_diag = Arc::new(new_l1(coarse_op.mat_ref()));
-            let dyn_op: Arc<dyn LinOp<f64> + Send> = coarse_op
-                .par_op()
-                .map(|op| op as Arc<dyn LinOp<f64> + Send>)
-                .unwrap_or(coarse_op.arc_mat());
-            let stationary = StationaryIteration::new(dyn_op, l1_diag, 3);
-            let stack_req = stationary
-                .apply_in_place_scratch(coarse_near_null.ncols(), get_global_parallelism());
-            let mut buf = MemBuffer::new(stack_req);
-            let stack = MemStack::new(&mut buf);
-            stationary.apply_in_place(
-                coarse_near_null.as_mat_mut(),
-                get_global_parallelism(),
-                stack,
-            );
-
-            let interp_near_null = Arc::new(coarse_near_null);
-            let p = Arc::new(interpolation_mat);
-            let r = Arc::new(restriction_mat);
-            let partition = Arc::new(partition);
-
-            self.add_level(coarse_op, partition, interp_near_null, p, r);
-            level += 1;
-        }
-    }
-    */
-
     fn coarsen(&mut self) {
+        let near_null = self.get_near_null(0);
+        let op = self.get_op(0);
+        /*
         let candidate_dim = self.config.interp_candidate_dim as f64;
         let coarsest_dim = self.config.coarsest_dim as f64;
         let cf = self.config.partitioner_config.coarsening_factor;
 
-        let near_null = self.get_near_null(0);
-        let op = self.get_op(0);
         let fine_block_size = op.block_size() as f64;
         let ratio = candidate_dim / fine_block_size;
-        //let first_cf = cf * ratio;
+        let first_cf = cf * ratio;
         let first_cf = cf;
         let mut first_partitioner_conf = self.config.partitioner_config.clone();
         first_partitioner_conf.coarsening_factor = first_cf;
-
-        /*
-        let mut partitioner_configs: Vec<PartitionerConfig> = vec![first_partitioner_conf];
-        let mut size = self.get_mat_ref(0).nrows() as f64 / cf;
-
-        while size > coarsest_dim {
-            partitioner_configs.push(self.config.partitioner_config.clone());
-            size /= cf;
-        }
-
-        let ml_partitioner_config = MultilevelPartitionerConfig {
-            partitioner_configs,
-        };
-
-        let partitions = ml_partitioner_config.build_hierarchy(op, near_null.clone());
         */
-        let partition = first_partitioner_conf.build_partition(op, near_null.clone());
-        let partitions = [partition];
 
-        let n_candidates = self.config.interp_candidate_dim;
         let par = get_global_parallelism();
 
-        for (level, partition) in partitions.into_iter().enumerate() {
+        // TODO: multilevel...
+        //loop {
+        for level in 0..1 {
             let fine_mat = self.current_op();
             let candidates = self.candidates.last().unwrap().clone();
-            //let candidates = self.near_nulls.last().unwrap().clone();
-            let (mut coarse_near_null, restriction_mat, interpolation_mat, coarse_mat) =
-                //smoothed_aggregation(
-                    least_squares(
-                    fine_mat.mat_ref(),
-                    &partition,
-                    fine_mat.block_size(),
-                    candidates.as_ref().as_ref(),
-                    self.nn_weights.as_ref().unwrap().clone(),
-                );
 
-            //let coarse_op = SparseMatOp::new(coarse_mat, n_candidates, par);
-            let coarse_op = SparseMatOp::new(coarse_mat, 1, par);
+            let sa = false;
+            let (mut coarse_near_null, restriction_mat, interpolation_mat, coarse_mat, partition) =
+                if sa {
+                    let partition = self.config.partitioner_config.build_partition(
+                        op.clone(),
+                        near_null.clone(),
+                        self.get_nn_weights(level),
+                    );
+                    smoothed_aggregation(
+                        fine_mat.mat_ref(),
+                        Arc::new(partition),
+                        fine_mat.block_size(),
+                        candidates.as_ref().as_ref(),
+                    )
+                } else {
+                    let smoother_partition_config = PartitionerConfig {
+                        coarsening_factor: 256.,
+                        ..Default::default()
+                    };
+                    let near_null = self.near_nulls().last().unwrap().clone();
+                    let smoother_partition = smoother_partition_config.build_partition(
+                        fine_mat.clone(),
+                        near_null,
+                        self.nn_weights.as_ref(),
+                    );
+                    least_squares(
+                        fine_mat.clone(),
+                        Arc::new(smoother_partition),
+                        candidates.as_ref().as_ref(),
+                        self.nn_weights.as_ref().unwrap().clone(),
+                    )
+                };
+
+            // TODO: just build `SparseMatOp` in interp routines? (as part of new struct)
+            let n_candidates = if sa {
+                self.config.interp_candidate_dim
+            } else {
+                1
+            };
+            let coarse_op = SparseMatOp::new(coarse_mat, n_candidates, par);
+
             let l1_diag = Arc::new(new_l1(coarse_op.mat_ref()));
             let dyn_op = coarse_op.dyn_op();
             let stationary = StationaryIteration::new(dyn_op, l1_diag, 3);
@@ -325,8 +281,8 @@ impl Hierarchy {
             let coarse_candidates = Arc::new(coarse_near_null);
             let p = Arc::new(interpolation_mat);
             let r = Arc::new(restriction_mat);
-            let partition = Arc::new(partition);
-            /* two level only for now
+
+            /* TODO: two level only for now
             let max_dim = coarse_op.mat_ref().nrows();
             let near_null_dim = 128.min(max_dim);
             let smoother_block = 64.min(max_dim);
@@ -340,118 +296,12 @@ impl Hierarchy {
                 &self
             );
         }
-
-        /*
-        let fine_mat = self.current_mat();
-
-        let fine_block_size = *self
-            .block_sizes
-            .last()
-            .ok_or(HierarchyError::MissingBlockSize)?;
-
-        /*
-        if params.interp_cols > fine_near_null.ncols() {
-            return Err(HierarchyError::InvalidInterpolationDim);
-        }
-        */
-
-        let partition = match params.partition {
-            Some(_partition) => unimplemented!(),
-            None => {
-                let strategy = self
-                    .partition_strategy
-                    .as_ref()
-                    .ok_or(HierarchyError::MissingPartitionStrategy)?;
-                let mut partition = if fine_block_size == 1 {
-                    Partition::singleton(fine_mat.nrows())
-                } else {
-                    let node_to_agg: Vec<usize> = (0..fine_mat.nrows())
-                        .map(|node_id| node_id / fine_block_size)
-                        .collect();
-                    Partition::from_node_to_agg(node_to_agg)
-                };
-
-                //let coarsening_near_null = self.near_nulls.last().unwrap();
-                let coarsening_near_null = smooth_vector_rand_svd(
-                    fine_mat.clone(),
-                    strategy.smoothing_iters,
-                    strategy.near_null_dim,
-                );
-
-                let scalar_partition = strategy.build_partition(
-                    fine_mat.clone(),
-                    fine_block_size,
-                    coarsening_near_null.as_ref(),
-                    params.coarsening_factor,
-                );
-                partition.compose(&scalar_partition);
-                partition
-            }
-        };
-        let partition = Arc::new(partition);
-
-        //let interpolation_near_null = fine_near_null.subcols(0, params.interp_cols);
-
-        //let ones: Mat<f64> = Mat::ones(fine_near_null.ncols(), 1);
-        //let interpolation_near_null = fine_near_null.as_ref() * ones;
-
-        //let interpolation_near_null = smooth_vector(fine_mat.clone(), 4, 1);
-        /*
-        for v in interpolation_near_null.col(0).iter() {
-            println!("{:.2e}", v);
-        }
-        */
-        let interpolation_near_null = self.near_nulls().last().unwrap();
-        let (mut coarse_near_null, restriction_mat, interpolation_mat, coarse_mat) =
-            smoothed_aggregation(
-                fine_mat.as_ref().as_ref(),
-                partition.as_ref(),
-                fine_block_size,
-                interpolation_near_null.as_ref(),
-                //ones.as_ref(),
-            );
-
-        let par_op = Arc::new(ParSpmmOp::new(coarse_mat.as_ref(), 16));
-        let l1_diag = Arc::new(new_l1(coarse_mat.as_ref().as_ref()));
-        let stationary = StationaryIteration::new(par_op, l1_diag, 3);
-        let stack_req =
-            stationary.apply_in_place_scratch(coarse_near_null.ncols(), get_global_parallelism());
-        let mut buf = MemBuffer::new(stack_req);
-        let stack = MemStack::new(&mut buf);
-        stationary.apply_in_place(
-            coarse_near_null.as_mat_mut(),
-            get_global_parallelism(),
-            stack,
-        );
-        /*
-        for triplet in interpolation_mat.triplet_iter() {
-            println!("{}, {} : {:.1}", triplet.row, triplet.col, triplet.val);
-        }
-        */
-        if coarse_mat.nrows() == fine_mat.nrows() {
-            return Err(HierarchyError::CoarseningDidNotReduce);
-        }
-
-        info!(
-            "Added level: {} -> {} DOFs ({} aggregates)",
-            fine_mat.nrows(),
-            coarse_mat.nrows(),
-            partition.naggs()
-        );
-
-        self.coarse_ops.push(Arc::new(coarse_mat));
-        self.restrictions.push(Arc::new(restriction_mat));
-        self.interpolations.push(Arc::new(interpolation_mat));
-        self.partitions.push(partition);
-        self.near_nulls.push(coarse_near_null);
-        Ok(self.current_mat().nrows())
-        */
     }
 
     pub fn add_level(
         &mut self,
         coarse_op: SparseMatOp,
-        partition: Arc<Partition>,
+        partition: PartitionType,
         near_null: Arc<Mat<f64>>,
         interpolation: Arc<SparseRowMat<usize, f64>>,
         restriction: Arc<SparseRowMat<usize, f64>>,
@@ -507,11 +357,11 @@ impl Hierarchy {
         self.operators.last().unwrap().mat_ref()
     }
 
-    pub fn partitions(&self) -> &[Arc<Partition>] {
+    pub fn partitions(&self) -> &[PartitionType] {
         &self.partitions
     }
 
-    pub fn get_partition(&self, level: usize) -> Arc<Partition> {
+    pub fn get_partition(&self, level: usize) -> PartitionType {
         self.partitions[level].clone()
     }
 
@@ -537,6 +387,21 @@ impl Hierarchy {
 
     pub fn get_near_null(&self, level: usize) -> Arc<Mat<f64>> {
         self.near_nulls[level].clone()
+    }
+
+    // TODO: make multilevel
+    pub fn get_nn_weights(&self, level: usize) -> Option<&Vec<f64>> {
+        self.nn_weights.as_ref()
+    }
+
+    pub fn get_candidate(&self, level: usize) -> Arc<Mat<f64>> {
+        self.candidates[level].clone()
+    }
+
+    pub fn grid_complexity(&self) -> f64 {
+        let total: usize = self.operators.iter().map(|op| op.mat_ref().nrows()).sum();
+        let fine_rows = self.operators[0].mat_ref().nrows() as f64;
+        total as f64 / fine_rows
     }
 
     pub fn op_complexity(&self) -> f64 {

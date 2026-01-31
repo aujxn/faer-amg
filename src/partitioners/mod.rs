@@ -1,10 +1,16 @@
 use faer::{
-    linalg::matmul::dot::inner_prod, prelude::Reborrow, sparse::SparseRowMatRef, Col, Mat, MatRef,
+    linalg::matmul::dot::inner_prod,
+    prelude::Reborrow,
+    sparse::{SparseRowMatRef, SymbolicSparseRowMatRef},
+    Col, Mat, MatRef,
 };
 use log::info;
 use petgraph::{graph::NodeIndex, Graph, Undirected};
-use rayon::iter::{
-    IntoParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator,
+use rayon::{
+    iter::{
+        IntoParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator,
+    },
+    slice::ParallelSliceMut,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, VecDeque},
@@ -15,9 +21,7 @@ use std::{
 pub mod modularity;
 pub mod multilevel;
 
-use crate::{
-    core::SparseMatOp, interpolation::weighted_least_squares, partitioners::modularity::Partitioner,
-};
+use crate::{core::SparseMatOp, partitioners::modularity::Partitioner};
 
 #[derive(Clone)]
 pub struct Partition {
@@ -277,6 +281,7 @@ impl PartitionerConfig {
         mat: SparseMatOp,
         near_null: Arc<Mat<f64>>,
         starting_partition: Option<Partition>,
+        weights: Option<&Vec<f64>>,
     ) -> Partitioner {
         let mat_ref = mat.mat_ref();
         let nn_ref = near_null.as_ref().as_ref();
@@ -287,7 +292,14 @@ impl PartitionerConfig {
             part.validate();
             assert_eq!(part.nnodes(), mat_ref.nrows() / mat.block_size());
         }
-        let mut strength = AdjacencyList::new_ls_strength_graph(mat_ref.rb(), nn_ref.rb());
+        let mut strength = match weights {
+            Some(weights) => {
+                AdjacencyList::new_ls_strength_graph(mat_ref.rb(), nn_ref.rb(), weights, 3)
+            }
+            None => {
+                unimplemented!();
+            }
+        };
         if block_size > 1 {
             let node_to_agg = (0..mat_ref.nrows())
                 .map(|node_id| node_id / block_size)
@@ -314,8 +326,13 @@ impl PartitionerConfig {
         Partitioner::new(strength, starting_partition, node_weights, self.clone())
     }
 
-    pub fn build_partition(&self, mat: SparseMatOp, near_null: Arc<Mat<f64>>) -> Partition {
-        let partitioner = self.build(mat, near_null, None);
+    pub fn build_partition(
+        &self,
+        mat: SparseMatOp,
+        near_null: Arc<Mat<f64>>,
+        weights: Option<&Vec<f64>>,
+    ) -> Partition {
+        let partitioner = self.build(mat, near_null, None, weights);
         partitioner.into_partition()
     }
 }
@@ -358,102 +375,92 @@ impl AdjacencyList {
         Self { nodes }
     }
 
-    pub fn new_ls_strength_graph(mat: SparseRowMatRef<usize, f64>, near_null: MatRef<f64>) -> Self {
-        let mut nodes = vec![Vec::new(); mat.ncols()];
-        let mut weights = Col::zeros(near_null.ncols());
-        let mut w_string = String::new();
-        for (w, nn) in weights.iter_mut().zip(near_null.col_iter()) {
-            let rhs = mat * nn;
-            *w = inner_prod(nn.transpose(), faer::Conj::No, rhs.as_ref(), faer::Conj::No)
-                .recip()
-                .sqrt();
-            //*w = 1.0;
-            w_string = format!("{} {:.2}", w_string, w);
-        }
-        info!("nn weigts: {}", w_string);
-        let w = weights.into_diagonal();
+    pub fn new_ls_strength_graph(
+        mat: SparseRowMatRef<usize, f64>,
+        near_null: MatRef<f64>,
+        weights: &Vec<f64>,
+        max_depth: usize,
+    ) -> Self {
+        let mut nodes: Vec<Vec<(usize, f64)>> = vec![Vec::new(); mat.ncols()];
+        let w = Col::from_iter(weights.iter().copied().take(near_null.ncols())).into_diagonal();
 
-        let mut max_w = 0.0;
+        let theta: f64 = 0.5;
+        let eps: f64 = 1e-30;
+
         for i in 0..mat.nrows() {
-            let cols = mat.col_idx_of_row(i);
-            let mut strengths = BTreeMap::new();
+            let local_nodes = extract_local_subgraph(mat.symbolic(), i, max_depth);
             let vi = near_null.row(i);
-            for neighbor in cols {
-                let d2 = mat.col_idx_of_row(neighbor);
-                for j in d2 {
-                    //let d3 = mat.col_idx_of_row(j);
-                    //for j in d3 {
-                    if i != j && !strengths.contains_key(&j) {
-                        let vj = near_null.row(j);
-
-                        let (_p_ij, error_norm_ij) =
-                            weighted_least_squares(w.rb(), vi.as_mat(), vj.rb());
-                        let (_p_ji, error_norm_ji) =
-                            weighted_least_squares(w.rb(), vj.as_mat(), vi.rb());
-                        //let strength = (1.0 + error_norm_ij.recip() + error_norm_ji.recip()).ln();
-                        let mut symm_relative = error_norm_ij / vi.squared_norm_l2()
-                            + error_norm_ji / vj.squared_norm_l2();
-                        symm_relative = symm_relative.sqrt();
-                        symm_relative /= 2.0;
-                        let strength = (1e-6 + symm_relative).recip();
-                        if strength > max_w {
-                            max_w = strength;
-                        }
-                        strengths.insert(j, strength);
-                    }
-                    //}
-                }
-            }
-            for (j, strength) in strengths {
-                nodes[i].push((j, strength));
+            let vi_norm = (vi.rb() * w.rb() * vi.transpose()).max(eps);
+            for &j in local_nodes.iter().filter(|j| **j > i) {
+                let vj = near_null.row(j);
+                let vj_norm = (vj.rb() * w.rb() * vj.transpose()).max(eps);
+                let vi_w_vjt = vi.rb() * w.rb() * vj.transpose();
+                let rho2 = (vi_w_vjt * vi_w_vjt) / (vi_norm * vj_norm);
+                let symm_relative = 2.0 * (1.0 - rho2).max(0.0).sqrt();
+                nodes[i].push((j, symm_relative));
+                nodes[j].push((i, symm_relative));
             }
         }
-        /*
-        for triplet in mat.triplet_iter() {
-            if triplet.row != triplet.col {
-                let vi = near_null.row(triplet.row);
-                let vj = near_null.row(triplet.col);
-                /*
-                let vi_w_vj = vi.as_ref() * w.as_ref() * vj.transpose();
-                let p_ij = vi_w_vj / vj.squared_norm_l2();
-                let p_ji = vi_w_vj / vi.squared_norm_l2();
-                let interp_error_ij = vi - p_ij * vj;
-                let interp_error_ji = vj - p_ji * vi;
-                let error_norm_ij =
-                    interp_error_ij.as_ref() * w.as_ref() * interp_error_ij.transpose();
-                let error_norm_ji =
-                    interp_error_ji.as_ref() * w.as_ref() * interp_error_ji.transpose();
-                */
-                let (_p_ij, error_norm_ij) =
-                    weighted_least_squares(w.rb(), vi.as_mat(), vj.as_mat());
-                let (_p_ji, error_norm_ji) =
-                    weighted_least_squares(w.rb(), vj.as_mat(), vi.as_mat());
-                //let strength = (1.0 + error_norm_ij.recip() + error_norm_ji.recip()).ln();
-                let strength = (0.1 + error_norm_ij + error_norm_ji).recip();
 
-                if strength > max_w {
-                    max_w = strength;
+        let eps = 1e-12;
+        let alpha = 4.0; // tune: bigger => more contrast (weaker edges closer to 0)
+
+        for neighborhood in nodes.iter_mut() {
+            // neighborhood: Vec<(j, d_ij)> where d smaller = stronger
+            neighborhood.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+
+            let keep_f = (neighborhood.len() as f64 * theta).floor() as usize;
+            let keep = keep_f.max(1);
+            neighborhood.truncate(keep);
+
+            let d_min = neighborhood.first().expect("graph is disconnected").1;
+            let d_max = neighborhood.last().expect("unreachable").1;
+
+            if (d_max - d_min).abs() < eps {
+                for (_j, w) in neighborhood.iter_mut() {
+                    *w = 1.0;
                 }
-                nodes[triplet.row].push((triplet.col, strength));
+            } else {
+                for (_j, d) in neighborhood.iter_mut() {
+                    let t = (d_max - *d) / (d_max - d_min + eps); // 1 at best, 0 at worst
+                    *d = t.powf(alpha);
+                }
             }
-        }
-        */
-        info!("MAX STRENGTH: {}", max_w);
 
-        //let min_strength = 1e-5;
-        nodes.par_iter_mut().for_each(|neighborhood| {
-            for (_, strength) in neighborhood.iter_mut() {
-                assert!(*strength > 0.0);
-                *strength /= max_w;
-                /*
-                * if *strength < min_strength {
-                                    *strength = min_strength;
-                                }
-                */
-            }
-        });
+            neighborhood.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        }
 
         Self { nodes }
+    }
+
+    pub fn maximal_independent_set(&self, f_points: &mut [bool]) -> Vec<usize> {
+        let mut new_c_points = Vec::new();
+        let mut degrees: Vec<(usize, f64)> = self
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| f_points[*i])
+            .map(|(i, neighborhood)| {
+                let strength_degree: f64 = neighborhood
+                    .iter()
+                    .filter(|(j, _)| f_points[*j])
+                    .map(|(_, w)| *w)
+                    .sum();
+                (i, strength_degree)
+            })
+            .collect();
+        degrees.par_sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).expect("bad float"));
+        for (i, _) in degrees {
+            if f_points[i] {
+                f_points[i] = false;
+                new_c_points.push(i);
+                for (j, _) in self.nodes[i].iter() {
+                    f_points[*j] = false;
+                }
+            }
+        }
+        assert!(f_points.iter().all(|b| !b));
+        new_c_points
     }
 
     pub fn nodes(&self) -> &Vec<Vec<(usize, f64)>> {
@@ -718,4 +725,29 @@ impl AdjacencyList {
 struct AggregateGraph {
     graph: Graph<(), f64, Undirected>,
     index_map: HashMap<usize, NodeIndex>,
+}
+
+pub fn extract_local_subgraph(
+    adjacency: SymbolicSparseRowMatRef<usize>,
+    center: usize,
+    max_depth: usize,
+) -> BTreeSet<usize> {
+    let mut to_visit: VecDeque<(usize, usize)> = VecDeque::new();
+    to_visit.push_back((center, 0));
+    let mut visited: BTreeSet<usize> = BTreeSet::new();
+    visited.insert(center);
+    loop {
+        match to_visit.pop_front() {
+            Some((j, depth)) => {
+                if depth < max_depth {
+                    for neighbor in adjacency.col_idx_of_row(j) {
+                        if visited.insert(neighbor) {
+                            to_visit.push_back((neighbor, depth + 1));
+                        }
+                    }
+                }
+            }
+            None => break visited,
+        }
+    }
 }

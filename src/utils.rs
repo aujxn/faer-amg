@@ -3,13 +3,32 @@ use std::{
     fs::File,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use faer::{
+    dyn_stack::{MemBuffer, MemStack, StackReq},
+    get_global_parallelism,
+    mat::AsMatMut,
+    matrix_free::{
+        conjugate_gradient::{
+            conjugate_gradient, conjugate_gradient_scratch, CgError, CgInfo, CgParams,
+        },
+        stationary_iteration::{
+            stationary_iteration, stationary_iteration_scratch, SliError, SliInfo, SliParams,
+        },
+        LinOp, Precond,
+    },
+    prelude::Reborrow,
     sparse::{SparseRowMat, SparseRowMatRef, Triplet},
-    Mat,
+    stats::{prelude::StandardNormal, CwiseMatDistribution, DistributionExt},
+    Col, ColRef, Mat, MatMut, MatRef,
 };
+use log::{info, warn};
+use rand::rng;
 use sci_bevy_comm::{load_triangle_mesh_data, MeshGeometry};
+
+use crate::{adaptivity::ErrorPropogator, core::SparseMatOp};
 
 pub fn mats_are_equal(left: &SparseRowMat<usize, f64>, right: &SparseRowMat<usize, f64>) -> bool {
     let l_shape = left.shape();
@@ -530,4 +549,189 @@ fn find_associated_vtk(base_path: &Path) -> Result<Option<PathBuf>, Box<dyn std:
     }
 
     Ok(None)
+}
+
+pub fn test_solver(
+    op: Arc<dyn LinOp<f64> + Sync + Send>,
+    pc: Arc<dyn Precond<f64> + Sync + Send>,
+    initial_guess: Option<MatRef<f64>>,
+    rhs: Option<MatRef<f64>>,
+    max_iters: usize,
+    tolerance: f64,
+) -> ((usize, f64, Mat<f64>), (usize, f64, Mat<f64>)) {
+    let par = get_global_parallelism();
+    let default_rhs = Mat::zeros(op.nrows(), 1);
+    let rhs = rhs.unwrap_or(default_rhs.as_ref());
+    let initial_guess_status = if initial_guess.is_some() {
+        faer::matrix_free::InitialGuessStatus::MaybeNonZero
+    } else {
+        faer::matrix_free::InitialGuessStatus::Zero
+    };
+    let default_dst = Mat::zeros(rhs.nrows(), rhs.ncols());
+    let dst = initial_guess.unwrap_or(default_dst.as_ref());
+
+    // TODO: so jank...
+    let pc = pc as Arc<dyn LinOp<f64> + Send + Sync>;
+    let cg_req = conjugate_gradient_scratch(&pc, &op, 1, par);
+    let sli_req = stationary_iteration_scratch(&pc, &op, 1, par);
+    let stack_req = StackReq::any_of(&[cg_req, sli_req]);
+    let mut buf = MemBuffer::new(stack_req);
+    let stack = MemStack::new(&mut buf);
+
+    let cg_params = CgParams {
+        abs_tolerance: 0.0,
+        rel_tolerance: tolerance,
+        max_iters,
+        initial_guess: initial_guess_status,
+        ..Default::default()
+    };
+    let sli_params = SliParams {
+        abs_tolerance: 0.0,
+        rel_tolerance: tolerance,
+        max_iters,
+        initial_guess: initial_guess_status,
+        ..Default::default()
+    };
+
+    let mut dst_cg = dst.to_owned();
+    info!(
+        "Running PCG solve with tolerance {:.2e} and max {} iterations",
+        cg_params.rel_tolerance, cg_params.max_iters
+    );
+    let cg_result = conjugate_gradient(
+        dst_cg.as_mut(),
+        &pc,
+        &op,
+        rhs.as_ref(),
+        cg_params,
+        |_| {},
+        par,
+        stack,
+    );
+    let (cg_residual, cg_iters) = report_cg(cg_result);
+
+    let mut dst_sli = dst.to_owned();
+    info!(
+        "Running SLI solve with tolerance {:.2e} and max {} iterations",
+        sli_params.rel_tolerance, sli_params.max_iters
+    );
+    let sli_result = stationary_iteration(
+        dst_sli.as_mut(),
+        &pc,
+        &op,
+        rhs.as_ref(),
+        sli_params,
+        |_| {},
+        par,
+        stack,
+    );
+    let (sli_residual, sli_iters) = report_sli(sli_result);
+
+    (
+        (cg_iters, cg_residual, dst_cg),
+        (sli_iters, sli_residual, dst_sli),
+    )
+}
+
+fn report_cg(result: Result<CgInfo<f64>, CgError<f64>>) -> (f64, usize) {
+    match result {
+        Ok(cg_info) => {
+            let cf = cg_info
+                .rel_residual
+                .powf((cg_info.iter_count as f64).recip());
+            info!(
+                "CG converged in {} iterations (abs {:.2e}, rel {:.2e}). Reduction per iter: {:.2}",
+                cg_info.iter_count, cg_info.abs_residual, cg_info.rel_residual, cf
+            );
+            (cg_info.rel_residual, cg_info.iter_count)
+        }
+        Err(err) => {
+            warn!("CG failed: {err:?}");
+            match err {
+                CgError::NoConvergence {
+                    abs_residual,
+                    rel_residual,
+                } => {
+                    let _ = abs_residual;
+                    (rel_residual, 1000)
+                }
+                _ => (0.0, 1000),
+            }
+        }
+    }
+}
+
+// TODO: estimate rho(E) in A-norm?
+fn report_sli(result: Result<SliInfo<f64>, SliError<f64>>) -> (f64, usize) {
+    match result {
+        Ok(sli_info) => {
+            let cf = sli_info
+                .rel_residual
+                .powf((sli_info.iter_count as f64).recip());
+            info!(
+                "SLI converged in {} iterations (abs {:.2e}, rel {:.2e}). Reduction per iter: {:.2}",
+                sli_info.iter_count, sli_info.abs_residual, sli_info.rel_residual, cf
+            );
+            (sli_info.rel_residual, sli_info.iter_count)
+        }
+        Err(err) => {
+            warn!("SLI failed: {err:?}");
+            match err {
+                SliError::NoConvergence {
+                    abs_residual,
+                    rel_residual,
+                } => {
+                    let _ = abs_residual;
+                    (rel_residual, 1000)
+                } //_ => (0.0, 1000),
+            }
+        }
+    }
+}
+
+pub fn approx_convergence_factor(mat: SparseMatOp, pc: Arc<dyn LinOp<f64> + Send>) -> f64 {
+    let mat_op = mat.dyn_op();
+    let iteration = ErrorPropogator {
+        op: mat_op.clone(),
+        pc: pc.clone(),
+    };
+    let iterations = 100;
+    let n = mat.mat_ref().nrows();
+
+    let rng = &mut rng();
+    let test_vecs = 5;
+    let mut x = CwiseMatDistribution {
+        nrows: n,
+        ncols: test_vecs,
+        dist: StandardNormal,
+    }
+    .rand::<Mat<f64>>(rng);
+
+    let par = get_global_parallelism();
+    let stack_req = iteration.apply_in_place_scratch(x.ncols(), par);
+    let mut buf = MemBuffer::new(stack_req);
+    let stack = MemStack::new(&mut buf);
+
+    let a_norm = |w: ColRef<f64>, stack: &mut MemStack| -> f64 {
+        let mut aw = Col::zeros(w.nrows());
+        mat_op.apply(aw.as_mat_mut(), w.rb().as_mat(), par, stack);
+        (w.rb().transpose() * aw.rb()).sqrt()
+    };
+    let normalize_cols = |x: MatMut<f64>, stack: &mut MemStack| {
+        for mut w in x.col_iter_mut() {
+            let w_a_norm = a_norm(w.rb(), stack);
+            w /= w_a_norm;
+        }
+    };
+
+    for _ in 0..iterations {
+        normalize_cols(x.as_mut(), stack);
+        iteration.apply_in_place(x.as_mut(), par, stack);
+    }
+
+    let norms: Vec<f64> = x.col_iter().map(|w| a_norm(w, stack)).collect();
+
+    let norm_string: String = norms.iter().map(|norm| format!("{:3} ", norm)).collect();
+    info!("approx ||E||_A: {}", norm_string);
+    norms.iter().copied().sum::<f64>() / test_vecs as f64
 }

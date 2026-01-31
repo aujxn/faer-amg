@@ -7,7 +7,7 @@ use faer::{
     sparse::{linalg::matmul::sparse_dense_matmul, SparseColMat, SparseRowMatRef, Triplet},
     MatMut, MatRef, Par,
 };
-use log::info;
+use log::{info, trace};
 use rayon::iter::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
 };
@@ -84,7 +84,7 @@ impl ParSpmmOp {
             .collect();
 
         let duration = Instant::now() - start;
-        info!(
+        trace!(
             "Finished par op construction in {} seconds",
             duration.as_secs()
         );

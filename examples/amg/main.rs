@@ -5,37 +5,42 @@ use env_logger;
 use faer::{
     dyn_stack::{MemBuffer, MemStack, StackReq},
     get_global_parallelism,
-    linalg::matmul::dot::inner_prod,
+    linalg::{matmul::dot::inner_prod, solvers::SelfAdjointEigen},
+    mat::AsMatRef,
     matrix_free::{
         conjugate_gradient::{
             conjugate_gradient, conjugate_gradient_scratch, CgError, CgInfo, CgParams,
         },
+        stationary_iteration::{stationary_iteration_scratch, SliParams},
         IdentityPrecond, LinOp, Precond,
     },
-    prelude::ReborrowMut,
-    sparse::SparseRowMat,
+    prelude::{Reborrow, ReborrowMut},
+    sparse::{SparseRowMat, SparseRowMatRef},
     stats::{
         prelude::StandardNormal, CwiseColDistribution, CwiseMatDistribution, DistributionExt,
         UnitaryMat,
     },
-    Col, Mat, Par,
+    Col, Mat, MatRef, Par, Side,
 };
 use faer_amg::{
     adaptivity::{find_near_null, smooth_vector_rand_svd, AdaptiveConfig, ErrorPropogator},
     core::SparseMatOp,
     decompositions::rand_svd::rand_svd,
-    hierarchy::HierarchyConfig,
+    hierarchy::{Hierarchy, HierarchyConfig, PartitionType},
     partitioners::{modularity::Partitioner, PartitionerCallback, PartitionerConfig},
     preconditioners::{
         block_smoothers::BlockSmootherConfig,
         multigrid::{symmetry_test, MultigridConfig},
         smoothers::StationaryIteration,
     },
-    utils::load_mfem_linear_system,
+    utils::{approx_convergence_factor, load_mfem_linear_system, test_solver},
 };
 use log::{info, warn, LevelFilter};
 use rand::{rngs::StdRng, SeedableRng};
 //use rand::{distr::Uniform, rng, rngs::StdRng, Rng, SeedableRng};
+use serde::Serialize;
+use std::fs;
+use std::io;
 
 #[derive(Parser)]
 #[command(name = "amg")]
@@ -107,6 +112,59 @@ enum CoefType {
     Spiral,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct InterpViz {
+    pub functions: Mat<f64>,
+    pub interpolation: Vec<(usize, usize, f64)>,
+    pub c_points: Vec<usize>,
+}
+
+impl InterpViz {
+    pub fn new(hierarchy: &Hierarchy) -> Self {
+        let p = hierarchy.get_interpolation(0);
+        let triplets = p
+            .triplet_iter()
+            .map(|triplet| (triplet.row, triplet.col, *triplet.val))
+            .collect();
+        let arc = hierarchy.get_candidate(0);
+        let nn = arc.as_mat_ref();
+        let mut functions = Mat::zeros(nn.nrows(), nn.ncols());
+
+        for (mut out_col, in_col) in functions.col_iter_mut().zip(nn.col_iter()) {
+            let max = in_col
+                .iter()
+                .map(|v| v.abs())
+                .max_by(|a, b| a.partial_cmp(b).unwrap())
+                .unwrap();
+            out_col.copy_from(in_col);
+            out_col /= max;
+        }
+        // TODO: multilevel and for SA needs to be different...
+        let c_points = match hierarchy.get_partition(0) {
+            PartitionType::Classical(cf_split) => cf_split.c_points().clone(),
+            PartitionType::Aggregation(_partition) => Vec::new(),
+        };
+
+        Self {
+            functions,
+            interpolation: triplets,
+            c_points,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct MeshViz {
+    pub coords: Mat<f64>,
+    pub interps: Vec<InterpViz>,
+}
+
+impl MeshViz {
+    pub fn new(hierarchy: &Hierarchy, coords: Mat<f64>) -> Self {
+        let interps = vec![InterpViz::new(hierarchy)];
+        Self { coords, interps }
+    }
+}
 fn main() -> Result<(), Box<dyn Error>> {
     env_logger::builder()
         .format_timestamp(None)
@@ -181,17 +239,40 @@ fn main() -> Result<(), Box<dyn Error>> {
         base_mat.clone(),
         cli.smoothing_iters,
         cli.coarsening_near_null_dim - 1,
-        cli.block_smoother_size,
+        cli.block_smoother_size as f64,
     );
+    // TODO: constant should be removed from subspace during iterative orthogonalization
     let mut nn_with_constant = Mat::ones(nn.nrows(), cli.coarsening_near_null_dim);
     nn_with_constant
         .subcols_mut(1, cli.coarsening_near_null_dim - 1)
         .copy_from(nn);
     let nn_basis = nn_with_constant.qr().compute_thin_Q();
-    let near_null = Arc::new(nn_basis);
 
-    let hierarchy = hierarchy_config.build(base_mat.clone(), near_null);
+    /*
+    let evd = SelfAdjointEigen::new(base_mat.mat_ref().to_dense().as_ref(), Side::Upper).unwrap();
+    let mut nn_basis = evd.U().subcols(0, cli.coarsening_near_null_dim).to_owned();
+    let eigvals: String = evd
+        .S()
+        .column_vector()
+        .iter()
+        .take(cli.coarsening_near_null_dim)
+        .map(|eigval| format!("{:.2e} ", eigval))
+        .collect();
+    info!("eigvals: {}", eigvals);
+    let n = nn_basis.nrows() as f64;
+    let const_val = 1. / n.sqrt();
+    nn_basis.col_mut(0).iter_mut().for_each(|v| *v = const_val);
+    */
+
+    let weights = create_weights(nn_basis.as_mat_ref(), base_mat.mat_ref());
+    let near_null = Arc::new(nn_basis);
+    let hierarchy = hierarchy_config.build(base_mat.clone(), near_null, Some(weights));
     info!("{:?}", hierarchy);
+
+    let mesh_viz = MeshViz::new(&hierarchy, system.coords);
+    let serialized = serde_json::to_string(&mesh_viz)?;
+    let file_path = "hierarchy_viz.json";
+    fs::write(file_path, serialized)?;
 
     let smoother_partitioner_config = PartitionerConfig {
         coarsening_factor: cli.block_smoother_size as f64,
@@ -205,7 +286,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     let multigrid_config = MultigridConfig {
         smoother_config,
-        smoothing_steps: 1,
+        smoothing_steps: 5,
         //mu: 2,
         ..Default::default()
     };
@@ -267,70 +348,30 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     */
 
-    info!(
-        "Running PCG solve with tolerance {:.2e} and max {} iterations",
-        cli.tolerance, cli.max_iters
-    );
     let rhs_vec: Col<f64> = rhs_full.col(0).to_owned();
-    //let mut dst: Col<f64> = Col::zeros(matrix.nrows());
-
-    let rng = &mut StdRng::seed_from_u64(42);
-    let mut dst = CwiseColDistribution {
-        nrows: rhs_full.nrows(),
-        dist: StandardNormal,
-    }
-    .rand::<Col<f64>>(rng);
-
-    let params = CgParams {
-        abs_tolerance: 0.0,
-        rel_tolerance: cli.tolerance,
-        max_iters: cli.max_iters,
-        initial_guess: faer::matrix_free::InitialGuessStatus::MaybeNonZero,
-        ..Default::default()
+    let dst: Col<f64> = if cli.zero_guess {
+        Col::zeros(base_mat.mat_ref().nrows())
+    } else {
+        let rng = &mut StdRng::seed_from_u64(42);
+        CwiseColDistribution {
+            nrows: rhs_full.nrows(),
+            dist: StandardNormal,
+        }
+        .rand::<Col<f64>>(rng)
     };
 
-    let matrix = base_mat.mat_ref();
-    let stack_req = conjugate_gradient_scratch(arc_pc.as_ref(), matrix, 1, par);
-    let mut buf = MemBuffer::new(stack_req);
-    let stack = MemStack::new(&mut buf);
-
-    let result = conjugate_gradient(
-        dst.as_mut().as_mat_mut(),
-        arc_pc.as_ref(),
-        matrix.as_ref(),
-        rhs_vec.as_mat(),
-        params,
-        |_| {},
-        par,
-        stack,
+    test_solver(
+        par_op,
+        arc_pc.clone(),
+        Some(dst.as_mat()),
+        Some(rhs_vec.as_mat()),
+        cli.max_iters,
+        cli.tolerance,
     );
 
-    report(result)?;
-
-    let mut residual = matrix.as_ref().as_ref() * dst.as_mat();
-    residual -= rhs_vec.as_mat();
-    let residual_norm = residual.norm_l2();
-    let rhs_norm = rhs_vec.as_mat().norm_l2();
-    let rel_residual = residual_norm / rhs_norm.max(1e-32);
-    info!(
-        "Final relative residual {:.2e} (||Ax-b|| = {:.2e}, ||b|| = {:.2e})",
-        rel_residual, residual_norm, rhs_norm
-    );
+    approx_convergence_factor(base_mat, arc_pc);
 
     Ok(())
-}
-
-fn report(result: Result<CgInfo<f64>, CgError<f64>>) -> Result<(), Box<dyn Error>> {
-    match result {
-        Ok(info) => {
-            info!(
-                "CG converged in {} iterations (abs {:.2e}, rel {:.2e})",
-                info.iter_count, info.abs_residual, info.rel_residual
-            );
-            Ok(())
-        }
-        Err(err) => Err(format!("CG failed: {err:?}").into()),
-    }
 }
 
 fn system_path(cli: &Cli) -> (PathBuf, String) {
@@ -376,4 +417,15 @@ fn callback(iter: usize, partitioner: &Partitioner) {
         edge_cost,
     );
     }
+}
+
+fn create_weights(nn_basis: MatRef<f64>, mat: SparseRowMatRef<usize, f64>) -> Vec<f64> {
+    nn_basis
+        .col_iter()
+        .map(|v| {
+            let av = mat.rb() * v.rb();
+            let vtav = v.transpose() * av;
+            vtav.recip()
+        })
+        .collect()
 }
