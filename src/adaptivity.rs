@@ -1,9 +1,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use faer::diag::Diag;
 use faer::dyn_stack::{MemBuffer, MemStack, StackReq};
-use faer::linalg::matmul::dot::inner_prod;
 use faer::linalg::temp_mat_scratch;
 use faer::mat::AsMatRef;
 use faer::matrix_free::{BiLinOp, BiPrecond, LinOp, Precond};
@@ -11,10 +9,9 @@ use faer::prelude::{Reborrow, ReborrowMut};
 use faer::sparse::SparseRowMatRef;
 use faer::stats::prelude::StandardNormal;
 use faer::stats::{CwiseMatDistribution, DistributionExt};
-use faer::{get_global_parallelism, Col, ColRef, Mat, MatMut, MatRef, Par};
+use faer::{get_global_parallelism, Col, Mat, MatMut, MatRef, Par};
 use log::info;
-use rand::rngs::StdRng;
-use rand::{rng, SeedableRng};
+use rand::rng;
 
 use crate::core::SparseMatOp;
 use crate::decompositions::rand_svd::rand_svd;
@@ -23,7 +20,7 @@ use crate::partitioners::PartitionerConfig;
 use crate::preconditioners::block_smoothers::BlockSmootherConfig;
 use crate::preconditioners::composite::Composite;
 use crate::preconditioners::multigrid::MultigridConfig;
-use crate::preconditioners::smoothers::{new_l1, StationaryIteration};
+use crate::preconditioners::smoothers::new_l1;
 
 #[derive(Clone, Debug)]
 pub struct AdaptiveConfig {
@@ -259,7 +256,7 @@ pub fn smooth_vector_rand_svd(
         op: op.dyn_op(),
         pc: l1_diag,
     };
-    let (_u, s, v) = rand_svd(error_p, near_null_dim, 10, iterations);
+    let (_u, _s, v) = rand_svd(error_p, near_null_dim, 10, iterations);
 
     v
 }

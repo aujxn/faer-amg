@@ -3,30 +3,19 @@ use std::{error::Error, num::NonZeroUsize, path::PathBuf, sync::Arc};
 use clap::{Parser, ValueEnum};
 use env_logger;
 use faer::{
-    dyn_stack::{MemBuffer, MemStack, StackReq},
-    get_global_parallelism,
-    matrix_free::{
-        conjugate_gradient::{conjugate_gradient, conjugate_gradient_scratch},
-        stationary_iteration::{stationary_iteration, stationary_iteration_scratch},
-        IdentityPrecond, LinOp, Precond,
-    },
-    prelude::ReborrowMut,
-    sparse::{SparseRowMat, SparseRowMatRef},
+    matrix_free::LinOp,
     stats::{
-        prelude::StandardNormal, CwiseColDistribution, CwiseMatDistribution, DistributionExt,
-        UnitaryMat,
+        prelude::StandardNormal, CwiseColDistribution, DistributionExt,
     },
-    Col, ColRef, Mat, MatRef, Par,
+    Col, ColRef, MatRef, Par,
 };
 use faer_amg::{
-    adaptivity::{AdaptiveConfig, ErrorPropogator},
+    adaptivity::AdaptiveConfig,
     core::SparseMatOp,
-    decompositions::rand_svd::rand_svd,
     hierarchy::HierarchyConfig,
-    par_spmm::ParSpmmOp,
     partitioners::{modularity::Partitioner, PartitionerCallback, PartitionerConfig},
     preconditioners::{
-        block_smoothers::BlockSmootherConfig, composite::Composite, multigrid::MultigridConfig,
+        block_smoothers::BlockSmootherConfig, multigrid::MultigridConfig,
     },
     utils::{load_mfem_linear_system, test_solver},
 };

@@ -1,10 +1,7 @@
 use crate::{
     hierarchy::Hierarchy,
     par_spmm::{ParSpmmOp, PAR_BLOCK_SIZE},
-    partitioners::{multilevel::MultilevelPartitionerConfig, Partition, PartitionerConfig},
-    preconditioners::{
-        block_smoothers::BlockSmootherConfig, coarse_solvers::CoarseSolverKind, smoothers::new_l1,
-    },
+    preconditioners::{block_smoothers::BlockSmootherConfig, coarse_solvers::CoarseSolverKind},
 };
 use faer::{
     dyn_stack::{MemBuffer, MemStack, StackReq},
@@ -60,10 +57,13 @@ impl MultigridConfig {
         */
 
         let level_count = hierarchy.levels();
+        // TODO: smoothers should be built in hierarchy since they are needed for CR and near-null
+        // construction... This routine should just make parallel operators and make everything
+        // `Arc<dyn ...>` as needed
         let mut smoothers: Vec<Arc<dyn BiPrecond<f64> + Send>> = Vec::with_capacity(level_count);
 
         //let mut partition_config = hierarchy.get_config().partitioner_config.clone();
-        let mut partition_config = self.smoother_config.partitioner_config.clone();
+        let partition_config = self.smoother_config.partitioner_config.clone();
         /*
         let n_levels = 4;
         //let cf: f64 = 128.;

@@ -25,6 +25,7 @@ impl CoarseSolverKind {
     ) -> Arc<dyn BiPrecond<f64> + Send> {
         match self {
             CoarseSolverKind::Svd => unimplemented!(),
+            // TODO: use dense if overall sparsity of `mat` is too dense (> 0.3 sparsity?)
             CoarseSolverKind::Cholesky => Arc::new(SparseCholeskySolve::new(mat)),
             //CoarseSolverKind::Cholesky => Arc::new(DenseCholeskySolve::from_sparse(mat).unwrap()),
             CoarseSolverKind::Eigh => unimplemented!(),
@@ -40,11 +41,14 @@ impl CoarseSolverKind {
     }
 }
 
+/* TODO: use (dense solvers) SelfAdjointEig and Svd to solve coarse problems
 #[derive(Clone, Debug)]
-pub struct SparseEigh {
-    decomp: DenseLlt<f64>,
+pub struct Eigh {
+    decomp: Evd<f64>,
     size: usize,
 }
+*/
+
 /// Dense Cholesky preconditioner used for coarse solves where building a sparse factorization
 /// would be overkill relative to the sub-problem size.
 #[derive(Clone, Debug)]
@@ -169,17 +173,15 @@ impl SparseCholeskySolve {
     pub fn new(sym_mat: SparseRowMatRef<usize, f64>) -> Self {
         let symb_llt =
             SymbolicLlt::try_new(sym_mat.symbolic().transpose(), faer::Side::Upper).unwrap();
-        //.expect(&format!("{:?}", sym_mat.symbolic()));
         let decomp =
             Llt::try_new_with_symbolic(symb_llt, sym_mat.transpose(), faer::Side::Upper).unwrap();
-        //.expect(&format!("{:?}", sym_mat));
         let size = sym_mat.nrows();
         Self { decomp, size }
     }
 }
 
 impl LinOp<f64> for SparseCholeskySolve {
-    // TODO: remove allocations in apply and learn how to use this stack
+    // TODO: remove allocations in apply and use stack
     fn apply_scratch(&self, rhs_ncols: usize, par: Par) -> StackReq {
         let _rhs_ncols = rhs_ncols;
         let _par = par;
@@ -199,7 +201,7 @@ impl LinOp<f64> for SparseCholeskySolve {
         let _stack = stack;
         let mut out = out;
         out.copy_from(rhs);
-        // TODO: use low level api...
+        // TODO: use low level api with stack...
         self.decomp.solve_in_place_with_conj(faer::Conj::No, out);
     }
 
@@ -214,7 +216,7 @@ impl LinOp<f64> for SparseCholeskySolve {
         let _stack = stack;
         let mut out = out;
         out.copy_from(rhs);
-        // TODO: use low level api...
+        // TODO: use low level api with stack...
         self.decomp.solve_in_place_with_conj(faer::Conj::Yes, out);
     }
 }

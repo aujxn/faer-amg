@@ -9,7 +9,6 @@ use std::{
 use faer::{
     dyn_stack::{MemBuffer, MemStack, StackReq},
     get_global_parallelism,
-    mat::AsMatMut,
     matrix_free::{
         conjugate_gradient::{
             conjugate_gradient, conjugate_gradient_scratch, CgError, CgInfo, CgParams,

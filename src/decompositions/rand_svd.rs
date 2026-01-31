@@ -3,14 +3,12 @@ use faer::dyn_stack::MemBuffer;
 use faer::dyn_stack::MemStack;
 use faer::dyn_stack::StackReq;
 use faer::get_global_parallelism;
-use faer::linalg::matmul::dot::inner_prod;
 use faer::mat::AsMatMut;
 use faer::matrix_free::BiLinOp;
 use faer::prelude::*;
 use faer::reborrow::ReborrowMut;
 use faer::stats::prelude::*;
 use faer::stats::CwiseMatDistribution;
-use log::info;
 use rand::rng;
 // TODO: Low level implementation later...
 pub fn rand_svd_scratch(

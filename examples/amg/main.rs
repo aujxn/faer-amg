@@ -3,36 +3,19 @@ use std::{error::Error, num::NonZeroUsize, path::PathBuf, sync::Arc};
 use clap::{Parser, ValueEnum};
 use env_logger;
 use faer::{
-    dyn_stack::{MemBuffer, MemStack, StackReq},
-    get_global_parallelism,
-    linalg::{matmul::dot::inner_prod, solvers::SelfAdjointEigen},
     mat::AsMatRef,
-    matrix_free::{
-        conjugate_gradient::{
-            conjugate_gradient, conjugate_gradient_scratch, CgError, CgInfo, CgParams,
-        },
-        stationary_iteration::{stationary_iteration_scratch, SliParams},
-        IdentityPrecond, LinOp, Precond,
-    },
-    prelude::{Reborrow, ReborrowMut},
-    sparse::{SparseRowMat, SparseRowMatRef},
-    stats::{
-        prelude::StandardNormal, CwiseColDistribution, CwiseMatDistribution, DistributionExt,
-        UnitaryMat,
-    },
-    Col, Mat, MatRef, Par, Side,
+    matrix_free::LinOp,
+    prelude::Reborrow,
+    sparse::SparseRowMatRef,
+    stats::{prelude::StandardNormal, CwiseColDistribution, DistributionExt},
+    Col, Mat, MatRef, Par,
 };
 use faer_amg::{
-    adaptivity::{find_near_null, smooth_vector_rand_svd, AdaptiveConfig, ErrorPropogator},
+    adaptivity::find_near_null,
     core::SparseMatOp,
-    decompositions::rand_svd::rand_svd,
     hierarchy::{Hierarchy, HierarchyConfig, PartitionType},
     partitioners::{modularity::Partitioner, PartitionerCallback, PartitionerConfig},
-    preconditioners::{
-        block_smoothers::BlockSmootherConfig,
-        multigrid::{symmetry_test, MultigridConfig},
-        smoothers::StationaryIteration,
-    },
+    preconditioners::{block_smoothers::BlockSmootherConfig, multigrid::MultigridConfig},
     utils::{approx_convergence_factor, load_mfem_linear_system, test_solver},
 };
 use log::{info, warn, LevelFilter};
@@ -40,7 +23,6 @@ use rand::{rngs::StdRng, SeedableRng};
 //use rand::{distr::Uniform, rng, rngs::StdRng, Rng, SeedableRng};
 use serde::Serialize;
 use std::fs;
-use std::io;
 
 #[derive(Parser)]
 #[command(name = "amg")]
@@ -401,11 +383,10 @@ fn callback(iter: usize, partitioner: &Partitioner) {
         let ((_max_agg, max_size), (_min_agg, min_size)) = partitioner.max_and_min_weighted_aggs();
 
         let size_cost = partitioner.total_agg_size_cost() as f32;
-        let dist_cost = partitioner.total_dist_cost() as f32;
         let edge_cost = partitioner.total_edge_cost() as f32;
 
         info!(
-        "Iter: {}\n\tfine nodes: {}\n\taggregates: {}\n\tcoarsening factor: {:.2}\n\tmax / min agg size: {} / {}\n\tsize cost: {:.2e}\n\tdist cost: {:.2e}\n\tedge cost: {:.2e}",
+        "Iter: {}\n\tfine nodes: {}\n\taggregates: {}\n\tcoarsening factor: {:.2}\n\tmax / min agg size: {} / {}\n\tsize cost: {:.2e}\n\tedge cost: {:.2e}",
         iter,
         p.nnodes(),
         p.naggs(),
@@ -413,7 +394,6 @@ fn callback(iter: usize, partitioner: &Partitioner) {
         max_size,
         min_size,
         size_cost,
-        dist_cost,
         edge_cost,
     );
     }

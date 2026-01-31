@@ -20,8 +20,6 @@ use crate::{
     preconditioners::coarse_solvers::CoarseSolverKind,
 };
 
-const STEP_CF: f64 = 4.0;
-
 #[derive(Copy, Clone, Debug)]
 #[non_exhaustive]
 pub enum BlockSmootherKind {
@@ -61,16 +59,7 @@ impl BlockSmootherConfig {
         near_null: Arc<Mat<f64>>,
         nn_weights: Option<&Vec<f64>>,
     ) -> BlockSmoother {
-        /*
-        let mut partition_config = self.partitioner_config.clone();
-        let n_levels = 4;
-        let cf: f64 = 128.;
-        partition_config.coarsening_factor = cf.powf(1. / n_levels as f64);
-        partition_config.max_improvement_iters = 100;
-        let ml_partitioner_config = MultilevelPartitionerConfig {
-            partitioner_configs: vec![partition_config; n_levels],
-        };
-        */
+        // TODO: multilevel partitioning algorithm for large coarsening factors
         let partition =
             self.partitioner_config
                 .build_partition(base_matrix.clone(), near_null, nn_weights);
@@ -106,29 +95,8 @@ impl BlockSmoother {
                 let csr = if vdim == 1 {
                     diagonally_compensate(agg, mat)
                 } else {
-                    /*
-                    let agg = agg
-                        .iter()
-                        .map(|block_i| {
-                            (0..vdim)
-                                .map(|offset_i| block_i * vdim + offset_i)
-                                .collect::<Vec<_>>()
-                        })
-                        .flatten()
-                        .collect();
-                    diagonally_compensate(&agg, mat)
-                    */
                     diagonally_compensate_vector(agg, mat, vdim)
                 };
-                /*
-                let mut test = csr.clone().into_transpose();
-                sub_assign(test.as_dyn_mut(), csr.transpose());
-                for v in test.val().iter() {
-                    if v.abs() > 1e-10 {
-                        panic!("not symmetric submatrix");
-                    }
-                }
-                */
 
                 match smoother {
                     BlockSmootherKind::GaussSeidel => {

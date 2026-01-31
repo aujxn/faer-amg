@@ -7,7 +7,7 @@ use faer::{
     sparse::{linalg::matmul::sparse_dense_matmul, SparseColMat, SparseRowMatRef, Triplet},
     MatMut, MatRef, Par,
 };
-use log::{info, trace};
+use log::trace;
 use rayon::iter::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
 };

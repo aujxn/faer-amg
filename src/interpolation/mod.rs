@@ -1,22 +1,16 @@
 use faer::{
-    diag::{self, Diag, DiagRef},
+    diag::DiagRef,
     dyn_stack::{MemBuffer, MemStack},
     get_global_parallelism,
-    linalg::matmul::dot::inner_prod,
-    mat::{AsMatMut, AsMatRef},
     matrix_free::{LinOp, Precond},
-    prelude::{Reborrow, ReborrowMut, Solve, SolveLstsq},
+    prelude::{Reborrow, Solve},
     sparse::{ops::add_assign, SparseRowMat, SparseRowMatRef, Triplet},
-    Col, ColRef, Mat, MatMut, MatRef, Row, RowRef,
+    Col, ColRef, Mat, MatRef, Row, RowRef,
 };
 use itertools::Itertools;
-use log::{info, trace, warn};
-use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    f64,
-    sync::Arc,
-};
+use log::{info, trace};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use std::{collections::BTreeSet, f64, sync::Arc};
 
 // TODO: split this up into seperate modules for aggregation and ruge-stuben like interpolation schemes
 //pub mod classical;
@@ -26,13 +20,8 @@ use crate::{
     adaptivity::ErrorPropogator,
     core::SparseMatOp,
     hierarchy::PartitionType,
-    partitioners::{extract_local_subgraph, AdjacencyList, Partition, PartitionerConfig},
-    preconditioners::{
-        block_smoothers::{
-            diagonally_compensate, diagonally_compensate_vector, BlockSmootherConfig,
-        },
-        smoothers::new_l1,
-    },
+    partitioners::{extract_local_subgraph, AdjacencyList, Partition},
+    preconditioners::block_smoothers::BlockSmootherConfig,
     utils::{matrix_stats, MatrixStats},
 };
 
@@ -641,14 +630,15 @@ pub fn smoothed_aggregation(
     )
 }
 
+/*
 fn csr_block_smoother(
     partition: &Partition,
     mat: SparseRowMatRef<usize, f64>,
     vdim: usize,
 ) -> SparseRowMat<usize, f64> {
-    let n_aggs = partition.naggs();
+    let _n_aggs = partition.naggs();
     let n = mat.nrows();
-    let mut permutation: Vec<usize> = partition
+    let permutation: Vec<usize> = partition
         .aggregates()
         .iter()
         .map(|agg| {
@@ -707,7 +697,7 @@ pub fn local_diag_inv(
     rhs: MatMut<f64>,
 ) {
     let mut rhs = rhs;
-    for (local_block_idx, global_block_idx) in agg.iter().enumerate() {
+    for (local_block_idx, _global_block_idx) in agg.iter().enumerate() {
         let mut block_inv = Mat::zeros(vdim, vdim);
         //let global_start = global_block_idx * vdim;
         let local_start = local_block_idx * vdim;
@@ -727,6 +717,7 @@ pub fn local_diag_inv(
     }
     rhs *= 0.5;
 }
+*/
 
 pub fn smooth_interpolation(
     mat: SparseRowMatRef<usize, f64>,

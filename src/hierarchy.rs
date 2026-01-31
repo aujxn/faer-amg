@@ -3,25 +3,19 @@ use faer::{
     get_global_parallelism,
     mat::AsMatMut,
     matrix_free::{LinOp, Precond},
-    sparse::{SparseRowMat, SparseRowMatRef},
-    Col, Mat,
+    sparse::{SparseRowMat, SparseRowMatRef}, Mat,
 };
 use log::info;
 use std::{fmt, sync::Arc};
 
 use crate::{
-    adaptivity::{find_near_null, smooth_vector_rand_svd, ErrorPropogator},
     core::SparseMatOp,
     interpolation::{least_squares, smoothed_aggregation, CoarseFineSplit},
-    par_spmm::ParSpmmOp,
     partitioners::{
-        multilevel::MultilevelPartitionerConfig, Partition, PartitionStats, PartitionerConfig,
+        Partition, PartitionStats, PartitionerConfig,
     },
-    preconditioners::{
-        block_smoothers::BlockSmootherConfig,
-        smoothers::{new_l1, StationaryIteration},
-    },
-    utils::{matrix_stats, write_matrix_stats_table, MatrixStats, NdofsFormat},
+    preconditioners::smoothers::{new_l1, StationaryIteration},
+    utils::{matrix_stats, write_matrix_stats_table, NdofsFormat},
 };
 
 // TODO: add interpolation config once implemented
@@ -341,7 +335,7 @@ impl Hierarchy {
         self.operators[level].arc_mat()
     }
 
-    pub fn get_mat_ref(&self, level: usize) -> SparseRowMatRef<usize, f64> {
+    pub fn get_mat_ref(&self, level: usize) -> SparseRowMatRef<'_, usize, f64> {
         self.operators[level].mat_ref()
     }
 
@@ -353,7 +347,7 @@ impl Hierarchy {
         self.operators.last().unwrap().arc_mat()
     }
 
-    pub fn current_mat_ref(&self) -> SparseRowMatRef<usize, f64> {
+    pub fn current_mat_ref(&self) -> SparseRowMatRef<'_, usize, f64> {
         self.operators.last().unwrap().mat_ref()
     }
 
@@ -390,7 +384,7 @@ impl Hierarchy {
     }
 
     // TODO: make multilevel
-    pub fn get_nn_weights(&self, level: usize) -> Option<&Vec<f64>> {
+    pub fn get_nn_weights(&self, _level: usize) -> Option<&Vec<f64>> {
         self.nn_weights.as_ref()
     }
 

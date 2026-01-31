@@ -1,11 +1,8 @@
 use faer::{
-    linalg::matmul::dot::inner_prod,
     prelude::Reborrow,
     sparse::{SparseRowMatRef, SymbolicSparseRowMatRef},
     Col, Mat, MatRef,
 };
-use log::info;
-use petgraph::{graph::NodeIndex, Graph, Undirected};
 use rayon::{
     iter::{
         IntoParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator,
@@ -13,7 +10,7 @@ use rayon::{
     slice::ParallelSliceMut,
 };
 use std::{
-    collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, VecDeque},
+    collections::{BTreeSet, BinaryHeap, VecDeque},
     fmt::{self, Debug, Formatter},
     sync::Arc,
 };
@@ -253,7 +250,6 @@ impl PartitionerCallback {
 pub struct PartitionerConfig {
     pub coarsening_factor: f64,
     pub agg_size_penalty: f64,
-    pub dist_penalty: f64,
     pub max_improvement_iters: usize,
     pub callback: Option<PartitionerCallback>,
 }
@@ -263,8 +259,6 @@ impl Default for PartitionerConfig {
         Self {
             coarsening_factor: 8.0,
             agg_size_penalty: 1e0,
-            //dist_penalty: 1e-6,
-            dist_penalty: 0.0,
             max_improvement_iters: 100,
             callback: None,
         }
@@ -343,38 +337,6 @@ pub(crate) struct AdjacencyList {
 }
 
 impl AdjacencyList {
-    pub fn new_strength_graph(mat: SparseRowMatRef<usize, f64>, near_null: MatRef<f64>) -> Self {
-        let mut nodes = vec![Vec::new(); mat.ncols()];
-        let mut max_w = 0.0;
-        for triplet in mat.triplet_iter() {
-            let mut strength = 0.0;
-            if triplet.row != triplet.col {
-                for vec in near_null.col_iter() {
-                    strength += -vec[triplet.row] * triplet.val * vec[triplet.col];
-                }
-                if strength > max_w {
-                    max_w = strength;
-                }
-                nodes[triplet.row].push((triplet.col, strength));
-            }
-        }
-
-        let min_strength = 1e-3;
-
-        nodes.par_iter_mut().for_each(|neighborhood| {
-            for (_, strength) in neighborhood.iter_mut() {
-                if *strength > 0.0 {
-                    *strength /= max_w;
-                }
-                if *strength < min_strength {
-                    *strength = min_strength;
-                }
-            }
-        });
-
-        Self { nodes }
-    }
-
     pub fn new_ls_strength_graph(
         mat: SparseRowMatRef<usize, f64>,
         near_null: MatRef<f64>,
@@ -463,6 +425,7 @@ impl AdjacencyList {
         new_c_points
     }
 
+    /*
     pub fn nodes(&self) -> &Vec<Vec<(usize, f64)>> {
         &self.nodes
     }
@@ -474,6 +437,7 @@ impl AdjacencyList {
             Err(_) => 0.0,
         }
     }
+    */
 
     pub fn pairwise_merge(&mut self, pairs: &Vec<(usize, usize)>, unmatched: &Vec<usize>) {
         let fine_n = self.nodes.len();
@@ -694,6 +658,7 @@ impl AdjacencyList {
         (combined, local_max)
     }
 
+    /*
     fn subgraph(&self, aggregate: &BTreeSet<usize>) -> AggregateGraph {
         let mut agg_graph = Graph::new_undirected();
         let mut index_map = HashMap::new();
@@ -720,12 +685,15 @@ impl AdjacencyList {
             index_map,
         }
     }
+    */
 }
 
+/*
 struct AggregateGraph {
     graph: Graph<(), f64, Undirected>,
     index_map: HashMap<usize, NodeIndex>,
 }
+*/
 
 pub fn extract_local_subgraph(
     adjacency: SymbolicSparseRowMatRef<usize>,

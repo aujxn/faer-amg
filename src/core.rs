@@ -73,7 +73,7 @@ impl SparseMatOp {
         }
     }
 
-    pub fn mat_ref(&self) -> SparseRowMatRef<usize, f64> {
+    pub fn mat_ref(&self) -> SparseRowMatRef<'_, usize, f64> {
         self.mat.as_ref().as_ref()
     }
 
