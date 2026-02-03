@@ -108,8 +108,8 @@ impl AdaptiveConfig {
         let initial_near_null = Arc::new(basis);
         let initial_hierarchy = self
             .hierarchy_config
-            //.build(mat.clone(), initial_near_null, Some(cfs));
-            .build(mat.clone(), initial_near_null, Some(weights));
+            //.build(mat.clone(), initial_near_null, Arc::new(cfs));
+            .build(mat.clone(), initial_near_null, Arc::new(weights));
         info!("Hierarchy 1 info:\n{:?}", initial_hierarchy);
         let first_component = self.multigrid_config.build(initial_hierarchy);
         let mut composite = Composite::new(mat.dyn_op(), Arc::new(first_component));
@@ -154,8 +154,8 @@ impl AdaptiveConfig {
             let near_null = Arc::new(smoothed);
             let hierarchy = self
                 .hierarchy_config
-                .build(mat.clone(), near_null, Some(cfs));
-            //.build(mat.clone(), near_null, Some(weights));
+                .build(mat.clone(), near_null, Arc::new(cfs));
+            //.build(mat.clone(), near_null, Arc::new(weights));
             info!("Hierarchy {} info:\n{:?}", n_components + 1, hierarchy);
             let component = self.multigrid_config.build(hierarchy);
             composite.push(Arc::new(component));
@@ -286,7 +286,7 @@ pub fn find_near_null(
         ..Default::default()
     };
     let weights = create_weights(smooth_basis.as_mat_ref(), mat.mat_ref());
-    let block_pc = block_smoother_config.build(mat.clone(), Arc::new(smooth_basis), Some(&weights));
+    let block_pc = block_smoother_config.build(mat.clone(), Arc::new(smooth_basis), &weights);
     let (smooth_basis, cfs) = smooth_vector(
         mat.clone(),
         Arc::new(block_pc),

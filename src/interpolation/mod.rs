@@ -20,10 +20,225 @@ use crate::{
     adaptivity::ErrorPropogator,
     core::SparseMatOp,
     hierarchy::PartitionType,
-    partitioners::{extract_local_subgraph, AdjacencyList, Partition},
+    partitioners::{extract_local_subgraph, AdjacencyList, Partition, PartitionerConfig},
     preconditioners::block_smoothers::BlockSmootherConfig,
     utils::{matrix_stats, MatrixStats},
 };
+
+#[derive(Debug, Clone)]
+pub enum InterpolationConfig {
+    Aggregation(AggregationConfig),
+    Classical(ClassicalConfig),
+}
+
+pub struct GalerkinCoarse {
+    pub interpolation: SparseRowMat<usize, f64>,
+    pub restriction: SparseRowMat<usize, f64>,
+    pub coarse_mat: SparseRowMat<usize, f64>,
+    pub coarse_nn: Mat<f64>,
+    pub partition: PartitionType,
+}
+
+impl InterpolationConfig {
+    pub fn build(
+        &self,
+        op: SparseMatOp,
+        near_null: MatRef<f64>,
+        nn_weights: &Vec<f64>,
+    ) -> GalerkinCoarse {
+        match &self {
+            InterpolationConfig::Aggregation(agg_conf) => agg_conf.build(op, near_null, nn_weights),
+            InterpolationConfig::Classical(rs_conf) => rs_conf.build(op, near_null, nn_weights),
+        }
+    }
+}
+
+impl Default for InterpolationConfig {
+    fn default() -> Self {
+        Self::Classical(ClassicalConfig::default())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AggregationConfig {
+    pub smoothing_steps: usize,
+    pub partitioner_config: PartitionerConfig,
+    pub candidate_dimension: usize,
+    // TODO: only supports jacobi smoothing right now but eventually custom smoothing with:
+    // pub smoother_config: SmootherConfig
+}
+
+impl Default for AggregationConfig {
+    fn default() -> Self {
+        Self {
+            smoothing_steps: 1,
+            candidate_dimension: 4,
+            partitioner_config: PartitionerConfig::default(),
+        }
+    }
+}
+
+impl AggregationConfig {
+    pub fn new(
+        smoothing_steps: usize,
+        candidate_dimension: usize,
+        partitioner_config: PartitionerConfig,
+    ) -> Self {
+        Self {
+            smoothing_steps,
+            candidate_dimension,
+            partitioner_config,
+        }
+    }
+
+    /*
+    pub fn new_block_jacobi(op: SparseMatOp) -> Self {
+        let _ = op;
+        unimplemented!()
+    }
+
+    pub fn new_scalar_jacobi(mat: SparseRowMatRef<usize, f64>) -> Self {
+        let jacobi_weight = 0.66;
+        let n = mat.nrows();
+        let jac: Vec<_> = (0..n)
+            .map(|i| {
+                let diag_val = mat.get(i, i).unwrap();
+                assert!(*diag_val > 1e-6, "Diagonal nearly zero: {:.2e}", diag_val);
+                Triplet::new(i, i, jacobi_weight * diag_val.recip())
+            })
+            .collect();
+        let m_inv = SparseRowMat::try_new_from_triplets(n, n, &jac).unwrap();
+        Self {
+            smoothing_steps: 1,
+            m_inv: Some(Arc::new(m_inv)),
+        }
+    }
+    */
+
+    pub fn new_unsmoothed(
+        partitioner_config: PartitionerConfig,
+        candidate_dimension: usize,
+    ) -> Self {
+        Self {
+            smoothing_steps: 0,
+            candidate_dimension,
+            partitioner_config,
+        }
+    }
+
+    pub fn build(
+        &self,
+        op: SparseMatOp,
+        near_null: MatRef<f64>,
+        nn_weights: &Vec<f64>,
+    ) -> GalerkinCoarse {
+        let ratio = self.candidate_dimension as f64 / op.block_size() as f64;
+        let mut p_config = self.partitioner_config.clone();
+        p_config.coarsening_factor *= ratio;
+        let partition = p_config.build_partition(op.clone(), near_null.as_ref(), nn_weights);
+
+        let (coarse_nn, restriction, interpolation, coarse_mat, partition) = smoothed_aggregation(
+            op.mat_ref(),
+            Arc::new(partition),
+            op.block_size(),
+            near_null,
+        );
+
+        GalerkinCoarse {
+            interpolation,
+            restriction,
+            coarse_mat,
+            coarse_nn,
+            partition,
+        }
+    }
+}
+
+#[derive(Default, Debug, Clone)]
+pub struct ClassicalConfig {
+    pub cr_options: CompatibleRelaxationConfig,
+    pub ls_options: LeastSquaresConfig,
+}
+
+impl ClassicalConfig {
+    pub fn build(
+        &self,
+        op: SparseMatOp,
+        near_null: MatRef<f64>,
+        nn_weights: &Vec<f64>,
+    ) -> GalerkinCoarse {
+        // TODO: somehow allow passing in of smoother. It's hard because CR needs to manipulate it
+        let smoother_partition_config = PartitionerConfig {
+            coarsening_factor: 256.,
+            ..Default::default()
+        };
+        let smoother_partition =
+            smoother_partition_config.build_partition(op.clone(), near_null.rb(), nn_weights);
+
+        let (coarse_nn, restriction, interpolation, coarse_mat, partition) = least_squares(
+            op,
+            Arc::new(smoother_partition),
+            near_null,
+            nn_weights,
+            &self.cr_options,
+            &self.ls_options,
+        );
+
+        GalerkinCoarse {
+            interpolation,
+            restriction,
+            coarse_mat,
+            coarse_nn,
+            partition,
+        }
+    }
+}
+
+#[derive(Default, Debug, Clone, Copy)]
+pub enum LsSolver {
+    #[default]
+    Constrained,
+    Regularized,
+}
+
+#[derive(Debug, Clone)]
+pub struct LeastSquaresConfig {
+    pub search_depth: usize,
+    pub depth_ls: usize,
+    pub solver: LsSolver,
+    pub max_interp: usize,
+    pub tau_threshold: f64,
+}
+
+impl Default for LeastSquaresConfig {
+    fn default() -> Self {
+        Self {
+            search_depth: 3,
+            depth_ls: 2,
+            solver: LsSolver::default(),
+            max_interp: 3,
+            tau_threshold: 1.2,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CompatibleRelaxationConfig {
+    // TODO: maybe do something here? as f64 -> f64 wont translate well to config file... probably
+    // can do something more sensible than this
+    //sigma_func: fn(f64) -> f64,
+    pub target_convergence: f64,
+    pub relax_steps: usize,
+}
+
+impl Default for CompatibleRelaxationConfig {
+    fn default() -> Self {
+        Self {
+            target_convergence: 0.3,
+            relax_steps: 5,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct InterpolationInfo {
@@ -319,26 +534,13 @@ impl CoarseFineSplit {
     }
 }
 
-/* TODO: create config / builder pattern for interpolation (least squares or aggregation based)
-*
-* LS config options:
-* - depth / depth_ls
-* - constrained / regularized
-* - max_interp
-* - tau
-*
-* - CR sub-options:
-*   - sigma func?
-*   - CR smoother
-*   - target convergence
-*   - relax steps
-*/
-pub fn least_squares(
+fn least_squares(
     fine_mat: SparseMatOp,
     smoother_partition: Arc<Partition>,
-    // TODO:? block_size: usize,
     near_null: MatRef<f64>,
-    nn_weights: Vec<f64>,
+    nn_weights: &Vec<f64>,
+    cr_options: &CompatibleRelaxationConfig,
+    ls_options: &LeastSquaresConfig,
 ) -> (
     Mat<f64>,
     SparseRowMat<usize, f64>,
@@ -346,7 +548,7 @@ pub fn least_squares(
     SparseRowMat<usize, f64>,
     PartitionType,
 ) {
-    //let _ = block_size;
+    // TODO: handle fine_mat.block_size?
     let matref = fine_mat.mat_ref();
     let n_fine = matref.nrows();
     let k = near_null.ncols();
@@ -357,13 +559,16 @@ pub fn least_squares(
     }
     let par = get_global_parallelism();
 
-    let depth = 3;
-    let strength_graph =
-        AdjacencyList::new_ls_strength_graph(matref, near_null, &nn_weights, depth);
+    let strength_graph = AdjacencyList::new_ls_strength_graph(
+        matref,
+        near_null,
+        &nn_weights,
+        ls_options.search_depth,
+    );
 
     let mut reduction_factor = 1.0;
-    let target_reduction = 0.15;
-    let relax_steps = 5;
+    let target_reduction = cr_options.target_convergence;
+    let relax_steps = cr_options.relax_steps;
     let mut c_points = BTreeSet::new();
     #[derive(Copy, Clone, PartialEq, Eq, Debug)]
     enum PointType {
@@ -442,10 +647,10 @@ pub fn least_squares(
     );
 
     let n_coarse = c_points.len();
-    let max_interp = 3;
+    let max_interp = ls_options.max_interp;
     let mut p_triplets = Vec::new();
-    let d_ls = depth + 2;
-    let tau = 1.2;
+    let d_ls = ls_options.depth_ls + ls_options.search_depth;
+    let tau = ls_options.tau_threshold;
 
     let mut coarse_near_null = Mat::zeros(c_points.len(), k);
     for ((coarse_idx, c_point), mut coarse_row) in c_points
@@ -517,7 +722,7 @@ pub fn least_squares(
     )
 }
 
-pub fn smoothed_aggregation(
+fn smoothed_aggregation(
     fine_mat: SparseRowMatRef<usize, f64>,
     partition: Arc<Partition>,
     block_size: usize,

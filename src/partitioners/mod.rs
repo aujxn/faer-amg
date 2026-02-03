@@ -273,12 +273,12 @@ impl PartitionerConfig {
     pub fn build(
         &self,
         mat: SparseMatOp,
-        near_null: Arc<Mat<f64>>,
+        near_null: MatRef<f64>,
         starting_partition: Option<Partition>,
-        weights: Option<&Vec<f64>>,
+        weights: &Vec<f64>,
     ) -> Partitioner {
         let mat_ref = mat.mat_ref();
-        let nn_ref = near_null.as_ref().as_ref();
+        let nn_ref = near_null.as_ref();
         let block_size = mat.block_size();
         assert_eq!(mat_ref.nrows(), mat_ref.ncols());
         assert_eq!(near_null.nrows(), mat_ref.nrows());
@@ -286,14 +286,11 @@ impl PartitionerConfig {
             part.validate();
             assert_eq!(part.nnodes(), mat_ref.nrows() / mat.block_size());
         }
-        let mut strength = match weights {
-            Some(weights) => {
-                AdjacencyList::new_ls_strength_graph(mat_ref.rb(), nn_ref.rb(), weights, 3)
-            }
-            None => {
-                unimplemented!();
-            }
-        };
+        // TODO: search depth as arg?
+        let depth = 3;
+        let mut strength =
+            AdjacencyList::new_ls_strength_graph(mat_ref.rb(), nn_ref.rb(), weights, depth);
+
         if block_size > 1 {
             let node_to_agg = (0..mat_ref.nrows())
                 .map(|node_id| node_id / block_size)
@@ -323,8 +320,8 @@ impl PartitionerConfig {
     pub fn build_partition(
         &self,
         mat: SparseMatOp,
-        near_null: Arc<Mat<f64>>,
-        weights: Option<&Vec<f64>>,
+        near_null: MatRef<f64>,
+        weights: &Vec<f64>,
     ) -> Partition {
         let partitioner = self.build(mat, near_null, None, weights);
         partitioner.into_partition()

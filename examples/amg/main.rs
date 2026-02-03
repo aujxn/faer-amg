@@ -14,6 +14,10 @@ use faer_amg::{
     adaptivity::find_near_null,
     core::SparseMatOp,
     hierarchy::{Hierarchy, HierarchyConfig, PartitionType},
+    interpolation::{
+        AggregationConfig, ClassicalConfig, CompatibleRelaxationConfig, InterpolationConfig,
+        LeastSquaresConfig, LsSolver,
+    },
     partitioners::{modularity::Partitioner, PartitionerCallback, PartitionerConfig},
     preconditioners::{block_smoothers::BlockSmootherConfig, multigrid::MultigridConfig},
     utils::{approx_convergence_factor, load_mfem_linear_system, test_solver},
@@ -108,7 +112,7 @@ impl InterpViz {
             .triplet_iter()
             .map(|triplet| (triplet.row, triplet.col, *triplet.val))
             .collect();
-        let arc = hierarchy.get_candidate(0);
+        let arc = hierarchy.get_near_null(0);
         let nn = arc.as_mat_ref();
         let mut functions = Mat::zeros(nn.nrows(), nn.ncols());
 
@@ -205,6 +209,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let rhs_full = system.rhs;
 
     let callback = PartitionerCallback::new(Arc::new(callback));
+    /*
     let partitioner_config = PartitionerConfig {
         coarsening_factor: cli.coarsening_factor,
         callback: Some(callback.clone()),
@@ -212,10 +217,30 @@ fn main() -> Result<(), Box<dyn Error>> {
         //agg_size_penalty: 1e1,
         ..Default::default()
     };
+    let agg_config = AggregationConfig::new(1, cli.interp_near_null_dim, partitioner_config)
+    let interpolation_config = InterpolationConfig::Aggregation(agg_config);
+    */
+
+    let cr_options = CompatibleRelaxationConfig {
+        relax_steps: 5,
+        target_convergence: 0.15,
+    };
+    let ls_options = LeastSquaresConfig {
+        search_depth: 3,
+        depth_ls: 2,
+        solver: LsSolver::Constrained,
+        max_interp: 3,
+        tau_threshold: 1.2,
+    };
+    let classical_config = ClassicalConfig {
+        cr_options,
+        ls_options,
+    };
+    let interpolation_config = InterpolationConfig::Classical(classical_config);
     let hierarchy_config = HierarchyConfig {
         coarsest_dim: cli.coarsest_dim,
-        partitioner_config,
-        interp_candidate_dim: cli.interp_near_null_dim,
+        interpolation_config,
+        max_levels: Some(2),
     };
     let nn = find_near_null(
         base_mat.clone(),
@@ -247,13 +272,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     */
 
     let weights = create_weights(nn_basis.as_mat_ref(), base_mat.mat_ref());
+    let weights = Arc::new(weights);
     let near_null = Arc::new(nn_basis);
-    let hierarchy = hierarchy_config.build(base_mat.clone(), near_null, Some(weights));
+    let hierarchy = hierarchy_config.build(base_mat.clone(), near_null, weights);
     info!("{:?}", hierarchy);
 
     let mesh_viz = MeshViz::new(&hierarchy, system.coords);
     let serialized = serde_json::to_string(&mesh_viz)?;
-    let file_path = "hierarchy_viz.json";
+    let file_path = "./data/hierarchy_viz.json";
     fs::write(file_path, serialized)?;
 
     let smoother_partitioner_config = PartitionerConfig {

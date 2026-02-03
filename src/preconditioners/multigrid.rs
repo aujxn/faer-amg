@@ -7,6 +7,7 @@ use faer::{
     dyn_stack::{MemBuffer, MemStack, StackReq},
     get_global_parallelism,
     linalg::temp_mat_scratch,
+    mat::AsMatRef,
     matrix_free::{BiLinOp, BiPrecond, LinOp, Precond},
     reborrow::*,
     stats::{prelude::StandardNormal, CwiseMatDistribution, DistributionExt},
@@ -79,8 +80,11 @@ impl MultigridConfig {
         for level in 0..(level_count - 1) {
             let op = hierarchy.get_op(level);
             let near_null = hierarchy.get_near_null(level);
-            let partition =
-                partition_config.build_partition(op, near_null, hierarchy.get_nn_weights(level));
+            let partition = partition_config.build_partition(
+                op,
+                near_null.as_ref().as_mat_ref(),
+                hierarchy.get_nn_weights(level),
+            );
             smoother_partitions.push(Arc::new(partition));
             /*
             let partitions = ml_partitioner_config.build_hierarchy(op.clone(), near_null.clone());

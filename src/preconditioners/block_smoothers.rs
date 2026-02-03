@@ -6,7 +6,7 @@ use std::{
 use faer::{
     dyn_stack::{MemBuffer, MemStack, StackReq},
     get_global_parallelism,
-    mat::AsMatMut,
+    mat::{AsMatMut, AsMatRef},
     matrix_free::{BiLinOp, BiPrecond, LinOp, Precond},
     prelude::{Reborrow, ReborrowMut},
     sparse::{SparseRowMat, SparseRowMatRef, Triplet},
@@ -57,12 +57,14 @@ impl BlockSmootherConfig {
         &self,
         base_matrix: SparseMatOp,
         near_null: Arc<Mat<f64>>,
-        nn_weights: Option<&Vec<f64>>,
+        nn_weights: &Vec<f64>,
     ) -> BlockSmoother {
         // TODO: multilevel partitioning algorithm for large coarsening factors
-        let partition =
-            self.partitioner_config
-                .build_partition(base_matrix.clone(), near_null, nn_weights);
+        let partition = self.partitioner_config.build_partition(
+            base_matrix.clone(),
+            near_null.as_ref().as_mat_ref(),
+            nn_weights,
+        );
         BlockSmoother::new(base_matrix, Arc::new(partition), self.block_smoother_kind)
     }
 
