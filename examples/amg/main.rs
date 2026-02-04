@@ -209,7 +209,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     let rhs_full = system.rhs;
 
     let callback = PartitionerCallback::new(Arc::new(callback));
-    /*
     let partitioner_config = PartitionerConfig {
         coarsening_factor: cli.coarsening_factor,
         callback: Some(callback.clone()),
@@ -217,10 +216,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         //agg_size_penalty: 1e1,
         ..Default::default()
     };
-    let agg_config = AggregationConfig::new(1, cli.interp_near_null_dim, partitioner_config)
+    let agg_config = AggregationConfig::new(1, cli.interp_near_null_dim, partitioner_config);
     let interpolation_config = InterpolationConfig::Aggregation(agg_config);
-    */
 
+    /*
     let cr_options = CompatibleRelaxationConfig {
         relax_steps: 5,
         target_convergence: 0.15,
@@ -237,6 +236,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         ls_options,
     };
     let interpolation_config = InterpolationConfig::Classical(classical_config);
+    */
     let hierarchy_config = HierarchyConfig {
         coarsest_dim: cli.coarsest_dim,
         interpolation_config,
@@ -395,8 +395,8 @@ fn system_path(cli: &Cli) -> (PathBuf, String) {
 
     let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("data")
-        .join("anisotropy")
-        //.join("isotropic")
+        //.join("anisotropy")
+        .join("isotropic")
         .join("2d")
         .join(base_coef_dir);
     let dataset_name = format!("h{}_p1", cli.refinements);

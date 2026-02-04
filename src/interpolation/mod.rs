@@ -142,6 +142,7 @@ impl AggregationConfig {
             Arc::new(partition),
             op.block_size(),
             near_null,
+            self.candidate_dimension,
         );
 
         GalerkinCoarse {
@@ -727,6 +728,7 @@ fn smoothed_aggregation(
     partition: Arc<Partition>,
     block_size: usize,
     near_null: MatRef<f64>,
+    candidate_dimension: usize,
 ) -> (
     Mat<f64>,
     SparseRowMat<usize, f64>,
@@ -758,17 +760,6 @@ fn smoothed_aggregation(
             local
                 .subrows_mut(local_j * block_size, block_size)
                 .copy_from(near_null.subrows(j * block_size, block_size));
-            /*
-            for offset in 0..block_size {
-                for (dest, src) in local
-                    .row_mut(local_j * block_size + offset)
-                    .iter_mut()
-                    .zip(near_null.row(j * block_size + offset).iter())
-                {
-                    *dest = *src;
-                }
-            }
-            */
         }
 
         let svd = local.thin_svd().unwrap();
