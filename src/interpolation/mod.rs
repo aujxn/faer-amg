@@ -143,6 +143,7 @@ impl AggregationConfig {
             op.block_size(),
             near_null,
             self.candidate_dimension,
+            self.smoothing_steps,
         );
 
         GalerkinCoarse {
@@ -729,6 +730,7 @@ fn smoothed_aggregation(
     block_size: usize,
     near_null: MatRef<f64>,
     candidate_dimension: usize,
+    smoothing_steps: usize,
 ) -> (
     Mat<f64>,
     SparseRowMat<usize, f64>,
@@ -742,7 +744,7 @@ fn smoothed_aggregation(
     assert_eq!(n_fine, partition.nnodes() * block_size);
     assert_eq!(n_fine, near_null.nrows());
     let k = near_null.ncols();
-    let mut coarse_near_null = Mat::zeros(n_coarse * k, k);
+    let mut coarse_near_null = Mat::zeros(n_coarse * candidate_dimension, k);
 
     // n_fine by n_coarse * k
     let mut p: Vec<Triplet<usize, usize, f64>> = Vec::new();
@@ -750,10 +752,10 @@ fn smoothed_aggregation(
         let local_rows = agg.len() * block_size;
         // could relax this but makes things much messier
         assert!(
-            local_rows >= k,
+            local_rows >= candidate_dimension,
             "Agg size of {} cannot support near-null dimension of {}",
             local_rows,
-            k
+            candidate_dimension
         );
         let mut local = Mat::zeros(local_rows, k);
         for (local_j, j) in agg.iter().copied().enumerate() {
@@ -779,14 +781,16 @@ fn smoothed_aggregation(
         */
         let r = s * r.transpose();
 
-        coarse_near_null.subrows_mut(coarse_idx * k, k).copy_from(r);
+        coarse_near_null
+            .subrows_mut(coarse_idx * candidate_dimension, candidate_dimension)
+            .copy_from(r.subrows(0, candidate_dimension));
 
         for (local_i, fine_i) in agg.iter().copied().enumerate() {
-            let col_start = coarse_idx * k;
+            let col_start = coarse_idx * candidate_dimension;
             let sub_q = q.subrows(local_i * block_size, block_size);
             let row_start = fine_i * block_size;
             for offset_i in 0..block_size {
-                for offset_j in 0..k {
+                for offset_j in 0..candidate_dimension {
                     p.push(Triplet {
                         row: row_start + offset_i,
                         col: col_start + offset_j,
@@ -797,16 +801,18 @@ fn smoothed_aggregation(
         }
     }
 
-    let mut p = SparseRowMat::try_new_from_triplets(n_fine, n_coarse * k, &p)
+    let mut p = SparseRowMat::try_new_from_triplets(n_fine, n_coarse * candidate_dimension, &p)
         .expect("failed to create SA interp sparse row matrix");
     let debug_stats = matrix_stats(p.as_ref());
     info!("{:?}", debug_stats);
 
-    if block_size == 1 {
-        p = smooth_interpolation(fine_mat, p.as_ref(), 0.66);
-    } else {
-        p = block_jacobi(fine_mat, block_size, p.as_ref());
-    };
+    for _ in 0..smoothing_steps {
+        if block_size == 1 {
+            p = smooth_interpolation(fine_mat, p.as_ref(), 0.66);
+        } else {
+            p = block_jacobi(fine_mat, block_size, p.as_ref());
+        };
+    }
     /*
     let m_inv = csr_block_smoother(partition, fine_mat.rb(), block_size);
     p = smooth_p(fine_mat, m_inv.as_ref(), p.as_ref());
