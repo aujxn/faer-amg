@@ -60,9 +60,35 @@ struct Cli {
     #[arg(long, default_value_t = 20)]
     smoothing_iters: usize,
 
-    /// Coarsening factor for aggregation (target fine-to-coarse ratio)
-    #[arg(long, short = 'c', alias = "cf", default_value_t = 8.0)]
-    coarsening_factor: f64,
+    /// Use smoothed aggregation interpolation with the given number of smoothing steps
+    #[arg(long, value_name = "STEPS", conflicts_with = "classical_interpolation")]
+    sa_interpolation: Option<usize>,
+
+    /// Coarsening factor for smoothed aggregation (target fine-to-coarse ratio)
+    #[arg(
+        long,
+        alias = "sa-cf",
+        default_value_t = 8.0,
+        requires = "sa_interpolation"
+    )]
+    sa_coarsening_factor: f64,
+
+    /// Use classical interpolation (mutually exclusive with --sa-interpolation)
+    #[arg(long, default_value_t = false, conflicts_with = "sa_interpolation")]
+    classical_interpolation: bool,
+
+    /// Classical interpolation options: tau=...,search=...,depth=...,max=...
+    #[arg(
+        long,
+        value_name = "KEY=VAL,...",
+        conflicts_with = "sa_interpolation",
+        requires = "classical_interpolation"
+    )]
+    classical_opts: Option<String>,
+
+    /// Choose between isotropic or anisotropic coefficient datasets
+    #[arg(long, value_enum, default_value_t = Anisotropy::Anisotropic)]
+    anisotropy: Anisotropy,
 
     /// Maximum improvement iterations for aggregation refinement
     #[arg(long, default_value_t = 200)]
@@ -83,6 +109,10 @@ struct Cli {
     /// Stop coarsening once the operator dimension falls at or below this size
     #[arg(long, default_value_t = 1000)]
     coarsest_dim: usize,
+
+    /// Maximum number of multigrid levels (omit for no limit)
+    #[arg(long)]
+    max_levels: Option<usize>,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
@@ -96,6 +126,12 @@ enum CoefType {
     #[value(alias = "sine_tangent")]
     SineTangent,
     Spiral,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+enum Anisotropy {
+    Isotropic,
+    Anisotropic,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -177,12 +213,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     if cli.coarsest_dim == 0 {
         return Err("coarsest_dim must be positive".into());
     }
-    if cli.coarsening_factor <= 1.0 {
-        warn!(
-            "Coarsening factor {:.2} is <= 1.0; multigrid hierarchy may not coarsen.",
-            cli.coarsening_factor
-        );
-    }
 
     let par = Par::Rayon(NonZeroUsize::new(16).expect("16 should be non-zero"));
     faer::set_global_parallelism(par);
@@ -209,12 +239,42 @@ fn main() -> Result<(), Box<dyn Error>> {
     let rhs_full = system.rhs;
 
     let callback = PartitionerCallback::new(Arc::new(callback));
-    // TODO: CLI arg for aggregation (with smoothing steps) do this block instead
-    let aggregation = false;
-    let smoothing_steps = 1;
-    let interpolation_config = if aggregation {
+    let use_classical = cli.classical_interpolation || cli.sa_interpolation.is_none();
+    let interpolation_config = if use_classical {
+        let cr_options = CompatibleRelaxationConfig {
+            relax_steps: 5,
+            target_convergence: 0.15,
+        };
+        let mut ls_options = LeastSquaresConfig {
+            search_depth: 3,
+            depth_ls: 2,
+            solver: LsSolver::Constrained,
+            max_interp: 3,
+            tau_threshold: 1.2,
+        };
+        if let Some(opts) = cli.classical_opts.as_deref() {
+            let overrides = parse_classical_opts(opts)?;
+            if let Some(tau) = overrides.tau_threshold {
+                ls_options.tau_threshold = tau;
+            }
+            if let Some(search_depth) = overrides.search_depth {
+                ls_options.search_depth = search_depth;
+            }
+            if let Some(depth_ls) = overrides.depth_ls {
+                ls_options.depth_ls = depth_ls;
+            }
+            if let Some(max_interp) = overrides.max_interp {
+                ls_options.max_interp = max_interp;
+            }
+        }
+        let classical_config = ClassicalConfig {
+            cr_options,
+            ls_options,
+        };
+        InterpolationConfig::Classical(classical_config)
+    } else if let Some(smoothing_steps) = cli.sa_interpolation {
         let partitioner_config = PartitionerConfig {
-            coarsening_factor: cli.coarsening_factor,
+            coarsening_factor: cli.sa_coarsening_factor,
             callback: Some(callback.clone()),
             max_improvement_iters: cli.aggregation_iters,
             //agg_size_penalty: 1e1,
@@ -227,28 +287,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         );
         InterpolationConfig::Aggregation(agg_config)
     } else {
-        let cr_options = CompatibleRelaxationConfig {
-            relax_steps: 5,
-            target_convergence: 0.15,
-        };
-        let ls_options = LeastSquaresConfig {
-            search_depth: 3,
-            depth_ls: 2,
-            solver: LsSolver::Constrained,
-            max_interp: 3,
-            tau_threshold: 1.2,
-        };
-        let classical_config = ClassicalConfig {
-            cr_options,
-            ls_options,
-        };
-        InterpolationConfig::Classical(classical_config)
+        unreachable!("sa_interpolation is None and use_classical is false")
     };
 
     let hierarchy_config = HierarchyConfig {
         coarsest_dim: cli.coarsest_dim,
         interpolation_config,
-        max_levels: Some(2),
+        max_levels: cli.max_levels,
     };
     let nn = find_near_null(
         base_mat.clone(),
@@ -284,6 +329,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let near_null = Arc::new(nn_basis);
     let hierarchy = hierarchy_config.build(base_mat.clone(), near_null, weights);
     info!("{:?}", hierarchy);
+    let op_complexity = hierarchy.op_complexity();
 
     let mesh_viz = MeshViz::new(&hierarchy, system.coords);
     let serialized = serde_json::to_string(&mesh_viz)?;
@@ -376,7 +422,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .rand::<Col<f64>>(rng)
     };
 
-    test_solver(
+    let ((cg_iters, _cg_residual, _dst_cg), (sli_iters, _sli_residual, _dst_sli)) = test_solver(
         par_op,
         arc_pc.clone(),
         Some(dst.as_mat()),
@@ -385,7 +431,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         cli.tolerance,
     );
 
-    approx_convergence_factor(base_mat, arc_pc);
+    // approximates \|E\|_A where E = I - M^{-1}A is the iteration matrix with multigrid op M^{-1}
+    let a_norm_of_e = approx_convergence_factor(base_mat, arc_pc);
+
+    println!(
+        "{} {} {} {}",
+        cg_iters, sli_iters, a_norm_of_e, op_complexity
+    );
 
     Ok(())
 }
@@ -401,15 +453,63 @@ fn system_path(cli: &Cli) -> (PathBuf, String) {
         CoefType::Spiral => "spiral",
     };
 
-    // TODO: add cli arg for isotropic vs anisotropic
     let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("data")
-        .join("anisotropy")
-        //.join("isotropic")
+        .join(match cli.anisotropy {
+            Anisotropy::Isotropic => "isotropic",
+            Anisotropy::Anisotropic => "anisotropy",
+        })
         .join("2d")
         .join(base_coef_dir);
     let dataset_name = format!("h{}_p1", cli.refinements);
     (data_dir, dataset_name)
+}
+
+#[derive(Default)]
+struct ClassicalOverrides {
+    tau_threshold: Option<f64>,
+    search_depth: Option<usize>,
+    depth_ls: Option<usize>,
+    max_interp: Option<usize>,
+}
+
+fn parse_classical_opts(input: &str) -> Result<ClassicalOverrides, Box<dyn Error>> {
+    let mut out = ClassicalOverrides::default();
+    if input.trim().is_empty() {
+        return Ok(out);
+    }
+    for item in input.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let (key, value) = item
+            .split_once('=')
+            .ok_or_else(|| format!("Invalid classical_opts entry '{item}', expected key=value"))?;
+        let key = key.trim();
+        let value = value.trim();
+        match key {
+            "tau" | "tau_threshold" => {
+                out.tau_threshold = Some(value.parse()?);
+            }
+            "search" | "search_depth" => {
+                out.search_depth = Some(value.parse()?);
+            }
+            "depth" | "depth_ls" => {
+                out.depth_ls = Some(value.parse()?);
+            }
+            "max" | "max_interp" => {
+                out.max_interp = Some(value.parse()?);
+            }
+            _ => {
+                return Err(format!(
+                    "Unknown classical_opts key '{key}' (expected tau, search, depth, max)"
+                )
+                .into());
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn callback(iter: usize, partitioner: &Partitioner) {
