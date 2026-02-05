@@ -8,10 +8,11 @@ use faer::{
     prelude::Reborrow,
     sparse::SparseRowMatRef,
     stats::{prelude::StandardNormal, CwiseColDistribution, DistributionExt},
-    Col, Mat, MatRef, Par,
+    Col, ColRef, Mat, MatRef, Par,
 };
 use faer_amg::{
     adaptivity::find_near_null,
+    adaptivity::AdaptiveConfig,
     core::SparseMatOp,
     hierarchy::{Hierarchy, HierarchyConfig, PartitionType},
     interpolation::{
@@ -22,7 +23,7 @@ use faer_amg::{
     preconditioners::{block_smoothers::BlockSmootherConfig, multigrid::MultigridConfig},
     utils::{approx_convergence_factor, load_mfem_linear_system, test_solver},
 };
-use log::{info, warn, LevelFilter};
+use log::{info, LevelFilter};
 use rand::{rngs::StdRng, SeedableRng};
 //use rand::{distr::Uniform, rng, rngs::StdRng, Rng, SeedableRng};
 use serde::Serialize;
@@ -113,6 +114,10 @@ struct Cli {
     /// Maximum number of multigrid levels (omit for no limit)
     #[arg(long)]
     max_levels: Option<usize>,
+
+    /// Use a composite adaptive preconditioner with this many components
+    #[arg(long, value_name = "N")]
+    composite: Option<usize>,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
@@ -213,6 +218,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     if cli.coarsest_dim == 0 {
         return Err("coarsest_dim must be positive".into());
     }
+    if let Some(components) = cli.composite {
+        if components == 0 {
+            return Err("composite must be positive".into());
+        }
+    }
 
     let par = Par::Rayon(NonZeroUsize::new(16).expect("16 should be non-zero"));
     faer::set_global_parallelism(par);
@@ -243,7 +253,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let interpolation_config = if use_classical {
         let cr_options = CompatibleRelaxationConfig {
             relax_steps: 5,
-            target_convergence: 0.15,
+            target_convergence: 0.02,
         };
         let mut ls_options = LeastSquaresConfig {
             search_depth: 3,
@@ -295,6 +305,46 @@ fn main() -> Result<(), Box<dyn Error>> {
         interpolation_config,
         max_levels: cli.max_levels,
     };
+    let smoother_partitioner_config = PartitionerConfig {
+        coarsening_factor: cli.block_smoother_size as f64,
+        callback: Some(callback.clone()),
+        max_improvement_iters: cli.aggregation_iters,
+        ..Default::default()
+    };
+    let smoother_config = BlockSmootherConfig {
+        partitioner_config: smoother_partitioner_config,
+        ..Default::default()
+    };
+    let multigrid_config = MultigridConfig {
+        smoother_config,
+        smoothing_steps: 3,
+        //mu: 2,
+        ..Default::default()
+    };
+
+    if let Some(components) = cli.composite {
+        let adaptive_config = AdaptiveConfig {
+            hierarchy_config,
+            multigrid_config,
+            test_iters: cli.smoothing_iters,
+            max_components: components,
+            coarsening_near_null_dim: cli.coarsening_near_null_dim,
+            ..Default::default()
+        };
+        let mut composite = adaptive_config.build(base_mat.clone());
+        let par_op = base_mat.par_op().unwrap() as Arc<dyn LinOp<f64> + Send + Sync>;
+        let results = test_composite(
+            &mut composite,
+            par_op,
+            rhs_full.as_ref(),
+            cli.max_iters,
+            cli.tolerance,
+        );
+        let composite_table = build_composite_table(&results);
+        info!("{composite_table}");
+        return Ok(());
+    }
+
     let nn = find_near_null(
         base_mat.clone(),
         cli.smoothing_iters,
@@ -336,22 +386,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     let file_path = "./data/hierarchy_viz.json";
     fs::write(file_path, serialized)?;
 
-    let smoother_partitioner_config = PartitionerConfig {
-        coarsening_factor: cli.block_smoother_size as f64,
-        callback: Some(callback.clone()),
-        max_improvement_iters: cli.aggregation_iters,
-        ..Default::default()
-    };
-    let smoother_config = BlockSmootherConfig {
-        partitioner_config: smoother_partitioner_config,
-        ..Default::default()
-    };
-    let multigrid_config = MultigridConfig {
-        smoother_config,
-        smoothing_steps: 3,
-        //mu: 2,
-        ..Default::default()
-    };
     let multigrid = multigrid_config.build(hierarchy);
 
     let par_op = base_mat.par_op().unwrap() as Arc<dyn LinOp<f64> + Send>;
@@ -543,4 +577,126 @@ fn create_weights(nn_basis: MatRef<f64>, mat: SparseRowMatRef<usize, f64>) -> Ve
             vtav.recip()
         })
         .collect()
+}
+
+type CompositeResult = (usize, usize, usize, f64, f64, f64);
+
+struct CompositeSolveResults {
+    pcg: Vec<CompositeResult>,
+    stationary: Vec<CompositeResult>,
+}
+
+fn test_composite(
+    composite: &mut faer_amg::preconditioners::composite::Composite,
+    matrix: Arc<dyn LinOp<f64> + Sync + Send>,
+    rhs: MatRef<'_, f64>,
+    max_iters: usize,
+    tolerance: f64,
+) -> CompositeSolveResults {
+    let mut pcg_results = Vec::new();
+    let mut stationary_results = Vec::new();
+
+    let rhs_vec: ColRef<f64> = rhs.col(0);
+    let rhs = Some(rhs_vec.as_mat());
+    let rng = &mut StdRng::seed_from_u64(42);
+    let initial_guess = CwiseColDistribution {
+        nrows: rhs_vec.nrows(),
+        dist: StandardNormal,
+    }
+    .rand::<Col<f64>>(rng);
+    let initial_guess = Some(initial_guess.as_mat());
+
+    while !composite.components().is_empty() {
+        let component_count = composite.components().len();
+        let arc_pc = Arc::new(composite.clone());
+
+        let ((cg_iters, cg_residual, _dst_cg), (sli_iters, sli_residual, _dst_sli)) = test_solver(
+            matrix.clone(),
+            arc_pc,
+            initial_guess,
+            rhs,
+            max_iters,
+            tolerance,
+        );
+        pcg_results.push(build_composite_result(
+            component_count,
+            cg_iters,
+            cg_residual,
+        ));
+        stationary_results.push(build_composite_result(
+            component_count,
+            sli_iters,
+            sli_residual,
+        ));
+
+        composite.components_mut().pop();
+    }
+
+    CompositeSolveResults {
+        pcg: pcg_results,
+        stationary: stationary_results,
+    }
+}
+
+fn build_results_table(results: &[CompositeResult]) -> String {
+    let mut table = String::new();
+    table.push_str("+------------+------------+------------+----------------------+----------------------+----------------------+\n");
+    table.push_str("| components | iterations | v-cycles   | reduction/iter       | reduction/v-cycle    | final rel residual   |\n");
+    table.push_str("+------------+------------+------------+----------------------+----------------------+----------------------+\n");
+    for (
+        component_count,
+        iter_count,
+        total_vcycles,
+        reduction_per_iter,
+        reduction_per_vcycle,
+        rel_residual,
+    ) in results
+    {
+        table.push_str(&format!(
+            "| {:>10} | {:>10} | {:>10} | {:>20.3} | {:>20.3} | {:>20.3e} |\n",
+            component_count,
+            iter_count,
+            total_vcycles,
+            reduction_per_iter,
+            reduction_per_vcycle,
+            rel_residual
+        ));
+    }
+    table.push_str("+------------+------------+------------+----------------------+----------------------+----------------------+\n");
+    table
+}
+
+fn build_composite_table(results: &CompositeSolveResults) -> String {
+    let pcg_table = build_results_table(&results.pcg);
+    let stationary_table = build_results_table(&results.stationary);
+    format!(
+        "Composite PCG results:\n{pcg_table}\nComposite stationary results:\n{stationary_table}"
+    )
+}
+
+fn build_composite_result(
+    component_count: usize,
+    iter_count: usize,
+    rel_residual: f64,
+) -> CompositeResult {
+    let vcycles_per_iter = 2 * component_count - 1;
+    let total_vcycles = iter_count * vcycles_per_iter;
+    let reduction_per_iter = if iter_count > 0 {
+        rel_residual.powf(1.0 / iter_count as f64)
+    } else {
+        0.0
+    };
+    let reduction_per_vcycle = if total_vcycles > 0 {
+        rel_residual.powf(1.0 / total_vcycles as f64)
+    } else {
+        0.0
+    };
+    (
+        component_count,
+        iter_count,
+        total_vcycles,
+        reduction_per_iter,
+        reduction_per_vcycle,
+        rel_residual,
+    )
 }

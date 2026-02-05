@@ -555,10 +555,13 @@ fn least_squares(
     let n_fine = matref.nrows();
     let k = near_null.ncols();
     let d = Col::from_iter(nn_weights.iter().copied().take(near_null.ncols())).into_diagonal();
+    /*
     let mut u0 = Col::zeros(n_fine);
     for col in near_null.col_iter() {
         u0 += col;
     }
+    */
+    let u0: Col<f64> = Col::ones(n_fine);
     let par = get_global_parallelism();
 
     let strength_graph = AdjacencyList::new_ls_strength_graph(
